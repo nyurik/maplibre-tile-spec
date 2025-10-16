@@ -1,6 +1,8 @@
 use std::io;
 use std::io::Write;
 
+#[expect(clippy::enum_glob_use)]
+use ColumnType::*;
 use borrowme::borrowme;
 use integer_encoding::VarIntWriter;
 
@@ -108,85 +110,63 @@ impl RawFeatureTable<'_> {
         for column in col_info {
             let optional;
             let value;
-            let stream_count;
             let name = column.name.unwrap_or("");
+            let mut stream_count = 0;
+
+            // Some types need to read a stream count first
+            if matches!(column.typ, Geometry | Str | OptStr) {
+                (input, stream_count) = utils::parse_varint::<usize>(input)?;
+            }
+
+            // Geometry needs special handling as it consumes multiple streams without optional
+            if matches!(column.typ, Geometry) {
+                let value_vec;
+                (input, value) = Stream::parse(input)?;
+                (input, value_vec) = Stream::parse_multiple(input, stream_count - 1)?;
+                geometry.set_once(Geometry::raw(value, value_vec))?;
+                continue;
+            }
+
+            // Parse optional stream if needed
+            (input, optional) = parse_optional(column.typ, input)?;
 
             match column.typ {
-                ColumnType::Id | ColumnType::OptId => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    id_stream.set_once(Id::raw(optional, RawIdValue::Id(value)))?;
-                }
-                ColumnType::LongId | ColumnType::OptLongId => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    id_stream.set_once(Id::raw(optional, RawIdValue::LongId(value)))?;
-                }
-                ColumnType::Geometry => {
-                    let value_vec;
-                    (input, stream_count) = utils::parse_varint::<usize>(input)?;
-                    (input, value) = Stream::parse(input)?;
-                    (input, value_vec) = Stream::parse_multiple(input, stream_count - 1)?;
-                    geometry.set_once(Geometry::raw(value, value_vec))?;
-                }
-                ColumnType::Bool | ColumnType::OptBool => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse_bool(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::Bool(value)));
-                }
-                ColumnType::I8 | ColumnType::OptI8 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::I8(value)));
-                }
-                ColumnType::U8 | ColumnType::OptU8 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::U8(value)));
-                }
-                ColumnType::I32 | ColumnType::OptI32 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::I32(value)));
-                }
-                ColumnType::U32 | ColumnType::OptU32 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::U32(value)));
-                }
-                ColumnType::I64 | ColumnType::OptI64 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::I64(value)));
-                }
-                ColumnType::U64 | ColumnType::OptU64 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::U64(value)));
-                }
-                ColumnType::F32 | ColumnType::OptF32 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::F32(value)));
-                }
-                ColumnType::F64 | ColumnType::OptF64 => {
-                    (input, optional) = parse_optional(column.typ, input)?;
-                    (input, value) = Stream::parse(input)?;
-                    properties.push(Property::raw(name, optional, RawPropValue::F64(value)));
-                }
-                ColumnType::Str | ColumnType::OptStr => {
-                    (input, stream_count) = utils::parse_varint::<usize>(input)?;
-                    (input, optional) = parse_optional(column.typ, input)?;
+                Str | OptStr => {
                     // if optional has a value, one stream has already been consumed
                     let stream_count = stream_count - usize::from(optional.is_some());
                     let value_vec;
                     (input, value_vec) = Stream::parse_multiple(input, stream_count)?;
                     properties.push(Property::raw(name, optional, RawPropValue::Str(value_vec)));
+                    continue;
                 }
-                ColumnType::Struct => {
-                    todo!("Struct column type not implemented yet");
-                }
+                Struct => todo!("Struct column type not implemented yet"),
+                // Boolean streams are special because they encode RLE values directly
+                Bool | OptBool => (input, value) = Stream::parse_bool(input)?,
+                _ => (input, value) = Stream::parse(input)?,
             }
+
+            let val = match column.typ {
+                Id | OptId => {
+                    id_stream.set_once(Id::raw(optional, RawIdValue::Id(value)))?;
+                    continue;
+                }
+                LongId | OptLongId => {
+                    id_stream.set_once(Id::raw(optional, RawIdValue::LongId(value)))?;
+                    continue;
+                }
+                Bool | OptBool => RawPropValue::Bool(value),
+                I8 | OptI8 => RawPropValue::I8(value),
+                U8 | OptU8 => RawPropValue::U8(value),
+                I32 | OptI32 => RawPropValue::I32(value),
+                U32 | OptU32 => RawPropValue::U32(value),
+                I64 | OptI64 => RawPropValue::I64(value),
+                U64 | OptU64 => RawPropValue::U64(value),
+                F32 | OptF32 => RawPropValue::F32(value),
+                F64 | OptF64 => RawPropValue::F64(value),
+                Geometry | Str | OptStr | Struct => unreachable!(),
+            };
+
+            properties.push(Property::raw(name, optional, val));
         }
         if input.is_empty() {
             Ok(RawFeatureTable {
@@ -206,9 +186,6 @@ fn parse_columns_meta(
     mut input: &'_ [u8],
     column_count: usize,
 ) -> MltRefResult<'_, (Vec<Column<'_>>, usize)> {
-    #[allow(clippy::enum_glob_use)]
-    use ColumnType::*;
-
     let mut col_info = Vec::with_capacity(column_count);
     let mut geometries = 0;
     let mut ids = 0;
