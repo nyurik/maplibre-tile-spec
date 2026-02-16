@@ -5,6 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use mlt_nom::geojson::FeatureCollection;
 use mlt_nom::parse_layers;
 
+#[cfg(feature = "tui")]
+mod visualizer;
+
 #[derive(Parser)]
 #[command(name = "mlt", about = "MapLibre Tile format utilities")]
 struct Cli {
@@ -18,6 +21,9 @@ enum Commands {
     Dump(DumpArgs),
     /// Parse an MLT file, decode all layers, and dump the result
     Decode(DumpArgs),
+    /// Visualize an MLT file in an interactive TUI
+    #[cfg(feature = "tui")]
+    Visualize(VisualizeArgs),
 }
 
 #[derive(Args)]
@@ -28,6 +34,13 @@ struct DumpArgs {
     /// Output format
     #[arg(short, long, default_value_t, value_enum)]
     format: OutputFormat,
+}
+
+#[cfg(feature = "tui")]
+#[derive(Args)]
+struct VisualizeArgs {
+    /// Path to the MLT file
+    file: PathBuf,
 }
 
 #[derive(Clone, Default, ValueEnum)]
@@ -46,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Dump(args) => dump(&args, false)?,
         Commands::Decode(args) => dump(&args, true)?,
+        #[cfg(feature = "tui")]
+        Commands::Visualize(args) => visualize(&args)?,
     }
 
     Ok(())
@@ -73,5 +88,20 @@ fn dump(args: &DumpArgs, decode: bool) -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+fn visualize(args: &VisualizeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let buffer = fs::read(&args.file)?;
+    let mut layers = parse_layers(&buffer)?;
+    
+    // Decode all layers before visualizing
+    for layer in &mut layers {
+        layer.decode_all()?;
+    }
+    
+    visualizer::run(&layers)?;
+    
     Ok(())
 }
