@@ -87,8 +87,7 @@ impl<'a> App<'a> {
         self.layers
             .iter()
             .find_map(|l| l.as_layer01())
-            .map(|l| f64::from(l.extent))
-            .unwrap_or(4096.0)
+            .map_or(4096.0, |l| f64::from(l.extent))
     }
     
     /// Calculate the bounding box for all geometries to be displayed
