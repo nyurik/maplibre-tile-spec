@@ -97,6 +97,24 @@ impl Debug for PropValue {
 }
 
 impl PropValue {
+    /// Returns the size in bytes of the underlying element type for this variant
+    #[must_use]
+    pub const fn element_size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            Self::Bool(_) => size_of::<bool>(),
+            Self::I8(_) => size_of::<i8>(),
+            Self::U8(_) => size_of::<u8>(),
+            Self::I32(_) => size_of::<i32>(),
+            Self::U32(_) => size_of::<u32>(),
+            Self::I64(_) => size_of::<i64>(),
+            Self::U64(_) => size_of::<u64>(),
+            Self::F32(_) => size_of::<f32>(),
+            Self::F64(_) => size_of::<f64>(),
+            Self::Str(_) | Self::Struct => 0,
+        }
+    }
+
     /// Convert the value at index `i` to a [`serde_json::Value`]
     #[must_use]
     #[expect(clippy::cast_possible_truncation)] // f64 stored as f32 in wire format

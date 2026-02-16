@@ -339,18 +339,18 @@ fn collect_stream_info(stream: &mlt_nom::v01::Stream, compressions: &mut HashSet
 }
 
 fn estimate_property_size(value: &mlt_nom::v01::PropValue) -> usize {
-    use std::mem::size_of;
     use mlt_nom::v01::PropValue;
+    let element_size = value.element_size();
     match value {
-        PropValue::Bool(v) => v.len() * size_of::<bool>(),
-        PropValue::I8(v) => v.len() * size_of::<i8>(),
-        PropValue::U8(v) => v.len() * size_of::<u8>(),
-        PropValue::I32(v) => v.len() * size_of::<i32>(),
-        PropValue::U32(v) => v.len() * size_of::<u32>(),
-        PropValue::I64(v) => v.len() * size_of::<i64>(),
-        PropValue::U64(v) => v.len() * size_of::<u64>(),
-        PropValue::F32(v) => v.len() * size_of::<f32>(),
-        PropValue::F64(v) => v.len() * size_of::<f64>(),
+        PropValue::Bool(v) => v.len() * element_size,
+        PropValue::I8(v) => v.len() * element_size,
+        PropValue::U8(v) => v.len() * element_size,
+        PropValue::I32(v) => v.len() * element_size,
+        PropValue::U32(v) => v.len() * element_size,
+        PropValue::I64(v) => v.len() * element_size,
+        PropValue::U64(v) => v.len() * element_size,
+        PropValue::F32(v) => v.len() * element_size,
+        PropValue::F64(v) => v.len() * element_size,
         PropValue::Str(v) => v.iter().map(|s| s.as_ref().map_or(0, String::len)).sum::<usize>(),
         PropValue::Struct => 0,
     }
