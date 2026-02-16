@@ -119,7 +119,7 @@ struct MltFileInfo {
 fn ls(args: &LsArgs) -> Result<(), Box<dyn std::error::Error>> {
     let base_path = &args.path;
     let files = collect_mlt_files(base_path, args.recursive)?;
-    
+
     if files.is_empty() {
         eprintln!("No .mlt files found");
         return Ok(());
@@ -164,9 +164,12 @@ fn ls(args: &LsArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn collect_mlt_files(path: &Path, recursive: bool) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+fn collect_mlt_files(
+    path: &Path,
+    recursive: bool,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut files = Vec::new();
-    
+
     if path.is_file() {
         if path.extension().and_then(|s| s.to_str()) == Some("mlt") {
             files.push(path.to_path_buf());
@@ -174,15 +177,19 @@ fn collect_mlt_files(path: &Path, recursive: bool) -> Result<Vec<PathBuf>, Box<d
     } else if path.is_dir() {
         collect_from_dir(path, &mut files, recursive)?;
     }
-    
+
     Ok(files)
 }
 
-fn collect_from_dir(dir: &Path, files: &mut Vec<PathBuf>, recursive: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn collect_from_dir(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    recursive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_file() {
             if path.extension().and_then(|s| s.to_str()) == Some("mlt") {
                 files.push(path);
@@ -191,20 +198,23 @@ fn collect_from_dir(dir: &Path, files: &mut Vec<PathBuf>, recursive: bool) -> Re
             collect_from_dir(&path, files, recursive)?;
         }
     }
-    
+
     Ok(())
 }
 
-fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dyn std::error::Error>> {
+fn analyze_mlt_file(
+    path: &Path,
+    base_path: &Path,
+) -> Result<MltFileInfo, Box<dyn std::error::Error>> {
     let buffer = fs::read(path)?;
     let original_size = buffer.len();
-    
+
     // Parse without decoding first to count streams and compressions
     let layers_raw = parse_layers(&buffer)?;
     let layer_count = layers_raw.len();
     let mut stream_count = 0;
     let mut compressions = HashSet::new();
-    
+
     // Count streams and compression types from raw data
     for layer in &layers_raw {
         if let Some(layer01) = layer.as_layer01() {
@@ -216,7 +226,7 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
                     collect_stream_info(stream, &mut compressions);
                 }
             }
-            
+
             // Count property streams
             for prop in &layer01.properties {
                 if let mlt_nom::v01::Property::Raw(_raw_prop) = prop {
@@ -224,35 +234,35 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
                     stream_count += 1;
                 }
             }
-            
+
             // Count ID stream
             if !matches!(layer01.id, mlt_nom::v01::Id::None) {
                 stream_count += 1;
             }
         }
     }
-    
+
     // Now decode to get feature counts and geometry types
     let mut layers = parse_layers(&buffer)?;
     for layer in &mut layers {
         layer.decode_all()?;
     }
-    
+
     let mut feature_count = 0;
     let mut geometries = HashSet::new();
     let mut decompressed_size = 0;
-    
+
     for layer in &layers {
         if let Some(layer01) = layer.as_layer01() {
             // Count features from geometry
             if let mlt_nom::v01::Geometry::Decoded(ref geom) = layer01.geometry {
                 feature_count += geom.vector_types.len();
-                
+
                 // Collect unique geometry types
                 for &geom_type in &geom.vector_types {
                     geometries.insert(format!("{geom_type:?}"));
                 }
-                
+
                 // Calculate decompressed size from decoded data
                 if let Some(ref verts) = geom.vertices {
                     decompressed_size += verts.len() * size_of::<i32>();
@@ -276,14 +286,14 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
                     decompressed_size += tris.len() * size_of::<u32>();
                 }
             }
-            
+
             // Add property data to decompressed size
             for prop in &layer01.properties {
                 if let mlt_nom::v01::Property::Decoded(decoded) = prop {
                     decompressed_size += estimate_property_size(&decoded.values);
                 }
             }
-            
+
             // Add ID data to decompressed size
             if let mlt_nom::v01::Id::Decoded(ref decoded_id) = layer01.id {
                 if let Some(ref ids) = decoded_id.0 {
@@ -292,7 +302,7 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
             }
         }
     }
-    
+
     // Calculate gzip compression savings
     let gzip_size = estimate_gzip_size(&buffer)?;
     #[allow(clippy::cast_precision_loss)]
@@ -301,11 +311,11 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
     } else {
         0.0
     };
-    
+
     // Format compression and geometry lists with abbreviations
     let compressions_str = format_compressions(&compressions);
     let geometries_str = format_geometries(&geometries);
-    
+
     // Get relative path
     let rel_path = if base_path.is_file() {
         // If base_path is a file, just use the filename
@@ -320,7 +330,7 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
             .to_string_lossy()
             .to_string()
     };
-    
+
     Ok(MltFileInfo {
         path: rel_path,
         layers: layer_count,
@@ -339,30 +349,16 @@ fn collect_stream_info(stream: &mlt_nom::v01::Stream, compressions: &mut HashSet
 }
 
 fn estimate_property_size(value: &mlt_nom::v01::PropValue) -> usize {
-    use mlt_nom::v01::PropValue;
-    let element_size = value.element_size();
-    match value {
-        PropValue::Bool(v) => v.len() * element_size,
-        PropValue::I8(v) => v.len() * element_size,
-        PropValue::U8(v) => v.len() * element_size,
-        PropValue::I32(v) => v.len() * element_size,
-        PropValue::U32(v) => v.len() * element_size,
-        PropValue::I64(v) => v.len() * element_size,
-        PropValue::U64(v) => v.len() * element_size,
-        PropValue::F32(v) => v.len() * element_size,
-        PropValue::F64(v) => v.len() * element_size,
-        PropValue::Str(v) => v.iter().map(|s| s.as_ref().map_or(0, String::len)).sum::<usize>(),
-        PropValue::Struct => 0,
-    }
+    value.estimated_size()
 }
 
 fn estimate_gzip_size(data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
     #[cfg(feature = "cli")]
     {
-        use std::io::Write as _;
-        use flate2::write::GzEncoder;
         use flate2::Compression;
-        
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data)?;
         let compressed = encoder.finish()?;
@@ -407,11 +403,11 @@ fn format_geometries(geometries: &HashSet<String>) -> String {
 fn print_table(infos: &[MltFileInfo]) {
     #[cfg(feature = "cli")]
     {
-        use comfy_table::{Table, Cell, Attribute, presets::UTF8_FULL};
-        
+        use comfy_table::{Attribute, Cell, Table, presets::UTF8_FULL};
+
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
-        
+
         // Add header
         table.set_header(vec![
             Cell::new("File").add_attribute(Attribute::Bold),
@@ -424,7 +420,7 @@ fn print_table(infos: &[MltFileInfo]) {
             Cell::new("Compressions").add_attribute(Attribute::Bold),
             Cell::new("Geometries").add_attribute(Attribute::Bold),
         ]);
-        
+
         // Add rows
         for info in infos {
             table.add_row(vec![
@@ -439,7 +435,7 @@ fn print_table(infos: &[MltFileInfo]) {
                 Cell::new(&info.geometries),
             ]);
         }
-        
+
         println!("{table}");
     }
     #[cfg(not(feature = "cli"))]

@@ -115,6 +115,39 @@ impl PropValue {
         }
     }
 
+    /// Returns the length of the vector for this variant
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bool(v) => v.len(),
+            Self::I8(v) => v.len(),
+            Self::U8(v) => v.len(),
+            Self::I32(v) => v.len(),
+            Self::U32(v) => v.len(),
+            Self::I64(v) => v.len(),
+            Self::U64(v) => v.len(),
+            Self::F32(v) => v.len(),
+            Self::F64(v) => v.len(),
+            Self::Str(v) => v.len(),
+            Self::Struct => 0,
+        }
+    }
+
+    /// Returns `true` if the property value contains no elements
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the total estimated size in bytes for this property value
+    #[must_use]
+    pub fn estimated_size(&self) -> usize {
+        match self {
+            Self::Str(v) => v.iter().map(|s| s.as_ref().map_or(0, String::len)).sum(),
+            _ => self.len() * self.element_size(),
+        }
+    }
+
     /// Convert the value at index `i` to a [`serde_json::Value`]
     #[must_use]
     #[expect(clippy::cast_possible_truncation)] // f64 stored as f32 in wire format
