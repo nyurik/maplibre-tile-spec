@@ -30,8 +30,6 @@ enum ViewMode {
     FileBrowser,
     /// Layer overview mode - all layers shown
     LayerOverview,
-    /// Detail mode - individual features visible
-    DetailMode,
 }
 
 /// Represents a selectable item in the tree view
@@ -63,6 +61,8 @@ struct App {
     list_state: ListState,
     hovered_item: Option<usize>,
     mouse_pos: Option<(u16, u16)>,
+    // Expansion state for layers (layer_index -> is_expanded)
+    expanded_layers: Vec<bool>,
 }
 
 impl App {
@@ -82,6 +82,7 @@ impl App {
             list_state: ListState::default(),
             hovered_item: None,
             mouse_pos: None,
+            expanded_layers: Vec::new(),
         }
     }
 
@@ -89,6 +90,13 @@ impl App {
         let tree_items = vec![TreeItem::AllLayers];
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+
+        // Auto-expand if only one layer
+        let expanded_layers = if layers.len() == 1 {
+            vec![true]
+        } else {
+            vec![false; layers.len()]
+        };
 
         Self {
             mode: ViewMode::LayerOverview,
@@ -102,6 +110,7 @@ impl App {
             list_state,
             hovered_item: None,
             mouse_pos: None,
+            expanded_layers,
         }
     }
 
@@ -118,6 +127,14 @@ impl App {
         self.layers = convert_to_owned_layers(&layers)?;
         self.current_file = Some(path.to_path_buf());
         self.mode = ViewMode::LayerOverview;
+
+        // Auto-expand if only one layer
+        self.expanded_layers = if self.layers.len() == 1 {
+            vec![true]
+        } else {
+            vec![false; self.layers.len()]
+        };
+
         self.build_tree_items();
         self.selected_index = 0;
         self.list_state.select(Some(0));
@@ -128,16 +145,16 @@ impl App {
     fn build_tree_items(&mut self) {
         self.tree_items.clear();
 
-        if self.mode == ViewMode::LayerOverview {
-            self.tree_items.push(TreeItem::AllLayers);
-        } else if self.mode == ViewMode::DetailMode {
-            self.tree_items.push(TreeItem::AllLayers);
+        // Always show all layers (not just root)
+        self.tree_items.push(TreeItem::AllLayers);
 
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                match layer {
-                    OwnedLayer::Tag01(l) => {
-                        self.tree_items.push(TreeItem::Layer { index: layer_idx });
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            match layer {
+                OwnedLayer::Tag01(l) => {
+                    self.tree_items.push(TreeItem::Layer { index: layer_idx });
 
+                    // Add features if layer is expanded
+                    if layer_idx < self.expanded_layers.len() && self.expanded_layers[layer_idx] {
                         if let OwnedGeometry::Decoded(geom) = &l.geometry {
                             for feature_idx in 0..geom.vector_types.len() {
                                 self.tree_items.push(TreeItem::Feature {
@@ -147,7 +164,9 @@ impl App {
                             }
                         }
                     }
-                    OwnedLayer::Unknown(_) => {}
+                }
+                OwnedLayer::Unknown(_) => {
+                    self.tree_items.push(TreeItem::Layer { index: layer_idx });
                 }
             }
         }
@@ -161,7 +180,7 @@ impl App {
                     self.file_list_state.select(Some(self.selected_file_index));
                 }
             }
-            ViewMode::LayerOverview | ViewMode::DetailMode => {
+            ViewMode::LayerOverview => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
                     self.list_state.select(Some(self.selected_index));
@@ -178,7 +197,7 @@ impl App {
                     self.file_list_state.select(Some(self.selected_file_index));
                 }
             }
-            ViewMode::LayerOverview | ViewMode::DetailMode => {
+            ViewMode::LayerOverview => {
                 if self.selected_index < self.tree_items.len().saturating_sub(1) {
                     self.selected_index += 1;
                     self.list_state.select(Some(self.selected_index));
@@ -195,13 +214,13 @@ impl App {
                 }
             }
             ViewMode::LayerOverview => {
-                self.mode = ViewMode::DetailMode;
-                self.build_tree_items();
-                self.selected_index = 0;
-                self.list_state.select(Some(0));
-            }
-            ViewMode::DetailMode => {
-                // Already in detail mode, nothing to do
+                // Toggle layer expansion on Enter
+                if let Some(TreeItem::Layer { index }) = self.tree_items.get(self.selected_index) {
+                    if *index < self.expanded_layers.len() {
+                        self.expanded_layers[*index] = !self.expanded_layers[*index];
+                        self.build_tree_items();
+                    }
+                }
             }
         }
         Ok(())
@@ -223,18 +242,91 @@ impl App {
                     false
                 }
             }
-            ViewMode::DetailMode => {
-                self.mode = ViewMode::LayerOverview;
-                self.build_tree_items();
-                self.selected_index = 0;
-                self.list_state.select(Some(0));
-                false
-            }
         }
     }
 
     fn get_selected_item(&self) -> &TreeItem {
         &self.tree_items[self.selected_index]
+    }
+
+    fn handle_left_arrow(&mut self) {
+        if self.mode != ViewMode::LayerOverview {
+            return;
+        }
+
+        if let Some(item) = self.tree_items.get(self.selected_index) {
+            match item {
+                TreeItem::Feature { layer_index, .. } => {
+                    // Navigate from feature to its layer name
+                    for (idx, tree_item) in self.tree_items.iter().enumerate() {
+                        if matches!(tree_item, TreeItem::Layer { index } if index == layer_index) {
+                            self.selected_index = idx;
+                            self.list_state.select(Some(idx));
+                            break;
+                        }
+                    }
+                }
+                TreeItem::Layer { .. } => {
+                    // Navigate from layer to "All Layers"
+                    self.selected_index = 0;
+                    self.list_state.select(Some(0));
+                }
+                TreeItem::AllLayers => {
+                    // Navigate to file list if available
+                    if !self.mlt_files.is_empty() {
+                        self.mode = ViewMode::FileBrowser;
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_right_arrow(&mut self) {
+        if self.mode != ViewMode::LayerOverview {
+            return;
+        }
+
+        if let Some(TreeItem::Feature { layer_index, .. }) =
+            self.tree_items.get(self.selected_index)
+        {
+            // Jump to next layer's name
+            let next_layer_idx = layer_index + 1;
+            for (idx, tree_item) in self.tree_items.iter().enumerate() {
+                if matches!(tree_item, TreeItem::Layer { index } if *index == next_layer_idx) {
+                    self.selected_index = idx;
+                    self.list_state.select(Some(idx));
+                    break;
+                }
+            }
+        }
+    }
+
+    fn handle_page_up(&mut self) {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                self.selected_file_index = self.selected_file_index.saturating_sub(10);
+                self.file_list_state.select(Some(self.selected_file_index));
+            }
+            ViewMode::LayerOverview => {
+                self.selected_index = self.selected_index.saturating_sub(10);
+                self.list_state.select(Some(self.selected_index));
+            }
+        }
+    }
+
+    fn handle_page_down(&mut self) {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                self.selected_file_index =
+                    (self.selected_file_index + 10).min(self.mlt_files.len().saturating_sub(1));
+                self.file_list_state.select(Some(self.selected_file_index));
+            }
+            ViewMode::LayerOverview => {
+                self.selected_index =
+                    (self.selected_index + 10).min(self.tree_items.len().saturating_sub(1));
+                self.list_state.select(Some(self.selected_index));
+            }
+        }
     }
 
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
@@ -479,7 +571,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                 ViewMode::FileBrowser => {
                     render_file_browser(f, &mut app);
                 }
-                ViewMode::LayerOverview | ViewMode::DetailMode => {
+                ViewMode::LayerOverview => {
                     let chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -514,35 +606,53 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                            KeyCode::Left => app.handle_left_arrow(),
+                            KeyCode::Right => app.handle_right_arrow(),
+                            KeyCode::PageUp => app.handle_page_up(),
+                            KeyCode::PageDown => app.handle_page_down(),
                             _ => {}
                         }
                     }
                 }
                 Event::Mouse(mouse) => {
-                    if let MouseEventKind::Moved = mouse.kind {
-                        app.mouse_pos = Some((mouse.column, mouse.row));
+                    match mouse.kind {
+                        MouseEventKind::Moved => {
+                            app.mouse_pos = Some((mouse.column, mouse.row));
 
-                        // Convert screen coordinates to canvas coordinates
-                        if let Some(area) = map_area {
-                            if mouse.column >= area.x
-                                && mouse.column < area.x + area.width
-                                && mouse.row >= area.y
-                                && mouse.row < area.y + area.height
-                            {
-                                let bounds = app.calculate_bounds();
-                                let rel_x =
-                                    f64::from(mouse.column - area.x) / f64::from(area.width);
-                                let rel_y = f64::from(mouse.row - area.y) / f64::from(area.height);
+                            // Convert screen coordinates to canvas coordinates
+                            if let Some(area) = map_area {
+                                if mouse.column >= area.x
+                                    && mouse.column < area.x + area.width
+                                    && mouse.row >= area.y
+                                    && mouse.row < area.y + area.height
+                                {
+                                    let bounds = app.calculate_bounds();
+                                    let rel_x =
+                                        f64::from(mouse.column - area.x) / f64::from(area.width);
+                                    let rel_y =
+                                        f64::from(mouse.row - area.y) / f64::from(area.height);
 
-                                // Map to canvas coordinates (accounting for canvas coordinate system)
-                                let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
-                                let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1); // Flip Y
+                                    // Map to canvas coordinates (accounting for canvas coordinate system)
+                                    let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
+                                    let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1); // Flip Y
 
-                                app.find_hovered_feature(canvas_x, canvas_y, bounds);
-                            } else {
-                                app.hovered_item = None;
+                                    app.find_hovered_feature(canvas_x, canvas_y, bounds);
+                                } else {
+                                    app.hovered_item = None;
+                                }
                             }
                         }
+                        MouseEventKind::ScrollUp => app.move_up(),
+                        MouseEventKind::ScrollDown => app.move_down(),
+                        MouseEventKind::Down(_button) => {
+                            // Handle clicks in tree panel
+                            if app.mode == ViewMode::LayerOverview {
+                                // We need to check if click is in tree area
+                                // For now, just implement for the list items
+                                // This requires tracking the tree panel area
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -603,17 +713,50 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let content = match item {
-                TreeItem::AllLayers => "All Layers".to_string(),
+            let (content, base_color) = match item {
+                TreeItem::AllLayers => ("All Layers".to_string(), None),
                 TreeItem::Layer { index } => {
                     let layer = &app.layers[*index];
                     match layer {
-                        OwnedLayer::Tag01(l) => format!("  Layer: {}", l.name),
-                        OwnedLayer::Unknown(_) => format!("  Layer {index}"),
+                        OwnedLayer::Tag01(l) => (format!("  Layer: {}", l.name), None),
+                        OwnedLayer::Unknown(_) => (format!("  Layer {index}"), None),
                     }
                 }
-                TreeItem::Feature { feature_index, .. } => {
-                    format!("    Feature {feature_index}")
+                TreeItem::Feature {
+                    layer_index,
+                    feature_index,
+                } => {
+                    // Get geometry type and calculate size
+                    let (geom_type, size) = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index]
+                    {
+                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                            if *feature_index < geom.vector_types.len() {
+                                let geom_type = &geom.vector_types[*feature_index];
+                                // Calculate size (number of vertices)
+                                let size = calculate_feature_size(geom, *feature_index);
+                                (Some(*geom_type), size)
+                            } else {
+                                (None, 0)
+                            }
+                        } else {
+                            (None, 0)
+                        }
+                    } else {
+                        (None, 0)
+                    };
+
+                    let type_str = if let Some(gt) = geom_type {
+                        format!("{gt:?}")
+                    } else {
+                        "Unknown".to_string()
+                    };
+
+                    let color = geom_type.map(get_geometry_type_color);
+
+                    (
+                        format!("    Feat {feature_index}: {type_str} ({size}v)"),
+                        color,
+                    )
                 }
             };
 
@@ -625,6 +768,8 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 Style::default()
                     .fg(Color::LightGreen)
                     .add_modifier(Modifier::UNDERLINED)
+            } else if let Some(color) = base_color {
+                Style::default().fg(color)
             } else {
                 Style::default()
             };
@@ -641,10 +786,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
-            format!("{filename} - Enter for details, Esc to go back, q to quit")
-        }
-        ViewMode::DetailMode => {
-            "Layers & Features (↑/↓ to navigate, Esc to go back, q to quit)".to_string()
+            format!("{filename} - Enter to expand/collapse, Esc to go back, q to quit")
         }
         ViewMode::FileBrowser => "Layers & Features".to_string(),
     };
@@ -652,6 +794,46 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
 
     f.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+/// Calculate the number of vertices for a feature
+fn calculate_feature_size(geom: &DecodedGeometry, feature_idx: usize) -> usize {
+    let verts = geom.vertices.as_deref().unwrap_or(&[]);
+
+    // This is a simplified calculation - we just count all vertices for now
+    // A more accurate version would parse through the offsets
+    match (
+        &geom.geometry_offsets,
+        &geom.part_offsets,
+        &geom.ring_offsets,
+    ) {
+        (Some(g), Some(p), Some(r)) if feature_idx < g.len().saturating_sub(1) => {
+            let start_part = g[feature_idx] as usize;
+            let end_part = g[feature_idx + 1] as usize;
+            if start_part < p.len() && end_part <= p.len() {
+                let start_ring = p[start_part] as usize;
+                let end_ring = p[end_part.min(p.len() - 1)] as usize;
+                if start_ring < r.len() && end_ring <= r.len() {
+                    let start_vert = r[start_ring] as usize;
+                    let end_vert = if end_ring < r.len() {
+                        r[end_ring] as usize
+                    } else {
+                        verts.len() / 2
+                    };
+                    return end_vert.saturating_sub(start_vert);
+                }
+            }
+            0
+        }
+        _ => {
+            // Simplified: just return total vertex count divided by feature count
+            if geom.vector_types.is_empty() {
+                0
+            } else {
+                (verts.len() / 2) / geom.vector_types.len()
+            }
+        }
+    }
 }
 
 fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
