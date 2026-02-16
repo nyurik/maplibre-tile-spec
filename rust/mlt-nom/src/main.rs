@@ -339,17 +339,18 @@ fn collect_stream_info(stream: &mlt_nom::v01::Stream, compressions: &mut HashSet
 }
 
 fn estimate_property_size(value: &mlt_nom::v01::PropValue) -> usize {
+    use std::mem::size_of;
     use mlt_nom::v01::PropValue;
     match value {
         PropValue::Bool(v) => v.len() * size_of::<bool>(),
-        PropValue::I8(v) => v.len(),
-        PropValue::U8(v) => v.len(),
-        PropValue::I32(v) => v.len() * 4,
-        PropValue::U32(v) => v.len() * 4,
-        PropValue::I64(v) => v.len() * 8,
-        PropValue::U64(v) => v.len() * 8,
-        PropValue::F32(v) => v.len() * 4,
-        PropValue::F64(v) => v.len() * 8,
+        PropValue::I8(v) => v.len() * size_of::<i8>(),
+        PropValue::U8(v) => v.len() * size_of::<u8>(),
+        PropValue::I32(v) => v.len() * size_of::<i32>(),
+        PropValue::U32(v) => v.len() * size_of::<u32>(),
+        PropValue::I64(v) => v.len() * size_of::<i64>(),
+        PropValue::U64(v) => v.len() * size_of::<u64>(),
+        PropValue::F32(v) => v.len() * size_of::<f32>(),
+        PropValue::F64(v) => v.len() * size_of::<f64>(),
         PropValue::Str(v) => v.iter().map(|s| s.as_ref().map_or(0, String::len)).sum::<usize>(),
         PropValue::Struct => 0,
     }
@@ -417,8 +418,8 @@ fn print_table(infos: &[MltFileInfo]) {
             Cell::new("Layers").add_attribute(Attribute::Bold),
             Cell::new("Features").add_attribute(Attribute::Bold),
             Cell::new("Streams").add_attribute(Attribute::Bold),
-            Cell::new("Decomp.Size").add_attribute(Attribute::Bold),
-            Cell::new("Comp.Size").add_attribute(Attribute::Bold),
+            Cell::new("Decomp. Size").add_attribute(Attribute::Bold),
+            Cell::new("Comp. Size").add_attribute(Attribute::Bold),
             Cell::new("Gzip%").add_attribute(Attribute::Bold),
             Cell::new("Compressions").add_attribute(Attribute::Bold),
             Cell::new("Geometries").add_attribute(Attribute::Bold),
