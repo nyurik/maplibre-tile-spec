@@ -21,8 +21,8 @@ pub enum Geometry<'a> {
 #[borrowme]
 #[derive(Debug, PartialEq)]
 pub struct RawGeometry<'a> {
-    meta: Stream<'a>,
-    items: Vec<Stream<'a>>,
+    pub meta: Stream<'a>,
+    pub items: Vec<Stream<'a>>,
 }
 
 /// Decoded geometry data
