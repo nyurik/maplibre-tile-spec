@@ -12,7 +12,7 @@ rust-version.workspace = true
 [[bin]]
 name = "mlt-nom"
 path = "src/main.rs"
-required-features = ["cli", "tui"]
+required-features = ["cli"]
 
 [features]
 default = ["cli", "tui"]

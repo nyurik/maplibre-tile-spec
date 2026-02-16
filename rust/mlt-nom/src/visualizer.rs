@@ -205,7 +205,7 @@ fn render_tree_panel(
                     format!("  Layer {index}")
                 }
             }
-            TreeItem::Feature { layer_index: _, feature_index } => {
+            TreeItem::Feature { feature_index, .. } => {
                 format!("    Feature {feature_index}")
             }
         };
