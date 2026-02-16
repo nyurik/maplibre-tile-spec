@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -296,6 +295,7 @@ fn analyze_mlt_file(path: &Path, base_path: &Path) -> Result<MltFileInfo, Box<dy
     
     // Calculate gzip compression savings
     let gzip_size = estimate_gzip_size(&buffer)?;
+    #[allow(clippy::cast_precision_loss)]
     let gzip_savings_pct = if original_size > 0 && gzip_size <= original_size {
         ((original_size - gzip_size) as f64 / original_size as f64) * 100.0
     } else {
@@ -358,6 +358,7 @@ fn estimate_property_size(value: &mlt_nom::v01::PropValue) -> usize {
 fn estimate_gzip_size(data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
     #[cfg(feature = "cli")]
     {
+        use std::io::Write as _;
         use flate2::write::GzEncoder;
         use flate2::Compression;
         
@@ -448,6 +449,7 @@ fn print_table(infos: &[MltFileInfo]) {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn format_size(size: usize) -> String {
     if size < 1024 {
         format!("{size}B")
