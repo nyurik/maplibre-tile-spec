@@ -24,3 +24,35 @@ Given the raw input bytes, the parser quickly runs over the input slice and only
 * **`OwnedRawId` struct** is auto-generated with the [borrowme crate](https://docs.rs/borrowme/latest/borrowme/) - it has the same fields as the `RawId` struct, but owns its data. This is useful when you want to store a `RawId` struct beyond the lifetime of the original input slice, or when you want to modify it or store the result of the encoding before storing it into a file.
 * **`DecodedId` struct** is used to store the decoded value. At the moment, only `DecodedGeometry` is implemented, but the same idea applies to other entities. The decoded values are stored in standard Rust types, e.g. `Vec<u64>` for IDs.
 * **`Id` enum** contains `Raw(RawId)` and `Decoded(DecodedId)` variants, with values described above. This allows `in-place` decoding, e.g. it is possible to decode just one property column / ID / Geometry, while keeping the rest in their raw form. The enum also has a corresponding `borrowme`-generated `OwnedId`.
+
+## CLI Tool
+
+The `mlt-nom` binary provides several commands for working with MLT files:
+
+### Commands
+
+* **`dump`** - Parse an MLT file and dump raw layer data without decoding
+* **`decode`** - Parse an MLT file, decode all layers, and dump the result (supports text and GeoJSON output)
+* **`visualize`** - Interactive TUI visualizer for MLT files
+
+### Visualizer
+
+The visualizer command provides an interactive terminal-based UI for exploring MLT files:
+
+```bash
+cargo run -- visualize path/to/file.mlt
+```
+
+Features:
+- **Tree View Panel (left)**: Browse layers and features in a hierarchical tree
+  - "All Layers" - shows all features from all layers
+  - Individual layers - shows all features in that layer
+  - Individual features - shows only the selected feature
+- **Map Panel (right)**: Visual representation of the geometries
+  - Shows the extent boundary as a thin rectangle
+  - Geometries are color-coded (cyan for normal, yellow for selected)
+  - Automatically adjusts bounds to fit all visible geometries
+- **Keyboard Navigation**:
+  - `↑`/`k` - Move selection up
+  - `↓`/`j` - Move selection down
+  - `q`/`Esc` - Quit the visualizer
