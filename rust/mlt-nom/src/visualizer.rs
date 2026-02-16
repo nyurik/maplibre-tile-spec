@@ -4,20 +4,24 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::widgets::canvas::Canvas;
-use ratatui::Terminal;
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use mlt_nom::layer::Layer;
 use mlt_nom::v01::{DecodedGeometry, GeometryType, OwnedGeometry};
-use mlt_nom::{parse_layers, OwnedLayer};
+use mlt_nom::{OwnedLayer, parse_layers};
 
 /// Visualization mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +38,13 @@ enum ViewMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TreeItem {
     AllLayers,
-    Layer { index: usize },
-    Feature { layer_index: usize, feature_index: usize },
+    Layer {
+        index: usize,
+    },
+    Feature {
+        layer_index: usize,
+        feature_index: usize,
+    },
 }
 
 /// Application state for the visualizer
@@ -60,7 +69,7 @@ impl App {
     fn new_file_browser(mlt_files: Vec<PathBuf>) -> Self {
         let mut file_list_state = ListState::default();
         file_list_state.select(Some(0));
-        
+
         Self {
             mode: ViewMode::FileBrowser,
             mlt_files,
@@ -75,12 +84,12 @@ impl App {
             mouse_pos: None,
         }
     }
-    
+
     fn new_single_file(layers: Vec<OwnedLayer>, file_path: Option<PathBuf>) -> Self {
         let tree_items = vec![TreeItem::AllLayers];
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        
+
         Self {
             mode: ViewMode::LayerOverview,
             mlt_files: Vec::new(),
@@ -95,66 +104,40 @@ impl App {
             mouse_pos: None,
         }
     }
-    
+
     fn load_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let buffer = fs::read(path)?;
         let mut layers = parse_layers(&buffer)?;
-        
+
         // Decode all layers first
         for layer in &mut layers {
             layer.decode_all()?;
         }
-        
-        // Clear existing layers and manually construct owned versions
-        self.layers.clear();
-        
-        for layer in &layers {
-            if let Layer::Tag01(l) = layer {
-                let owned_layer = mlt_nom::v01::OwnedLayer01 {
-                    name: l.name.to_string(),
-                    extent: l.extent,
-                    id: match &l.id {
-                        mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
-                        mlt_nom::v01::Id::None => mlt_nom::v01::OwnedId::None,
-                        _ => mlt_nom::v01::OwnedId::None, // Raw shouldn't happen after decode
-                    },
-                    geometry: match &l.geometry {
-                        mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
-                        _ => return Err("Geometry not decoded".into()),
-                    },
-                    properties: l.properties.iter().map(|p| {
-                        match p {
-                            mlt_nom::v01::Property::Decoded(d) => mlt_nom::v01::OwnedProperty::Decoded(d.clone()),
-                            _ => panic!("Property not decoded"),
-                        }
-                    }).collect(),
-                };
-                self.layers.push(OwnedLayer::Tag01(owned_layer));
-            }
-        }
-        
+
+        // Convert to owned layers
+        self.layers = convert_to_owned_layers(&layers)?;
         self.current_file = Some(path.to_path_buf());
         self.mode = ViewMode::LayerOverview;
         self.build_tree_items();
         self.selected_index = 0;
         self.list_state.select(Some(0));
-        
+
         Ok(())
     }
-    
+
     fn build_tree_items(&mut self) {
         self.tree_items.clear();
-        
+
         if self.mode == ViewMode::LayerOverview {
             self.tree_items.push(TreeItem::AllLayers);
         } else if self.mode == ViewMode::DetailMode {
             self.tree_items.push(TreeItem::AllLayers);
-            
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 match layer {
                     OwnedLayer::Tag01(l) => {
                         self.tree_items.push(TreeItem::Layer { index: layer_idx });
-                        
+
                         if let OwnedGeometry::Decoded(geom) = &l.geometry {
                             for feature_idx in 0..geom.vector_types.len() {
                                 self.tree_items.push(TreeItem::Feature {
@@ -169,7 +152,7 @@ impl App {
             }
         }
     }
-    
+
     fn move_up(&mut self) {
         match self.mode {
             ViewMode::FileBrowser => {
@@ -186,7 +169,7 @@ impl App {
             }
         }
     }
-    
+
     fn move_down(&mut self) {
         match self.mode {
             ViewMode::FileBrowser => {
@@ -203,7 +186,7 @@ impl App {
             }
         }
     }
-    
+
     fn handle_enter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         match self.mode {
             ViewMode::FileBrowser => {
@@ -223,11 +206,11 @@ impl App {
         }
         Ok(())
     }
-    
+
     fn handle_escape(&mut self) -> bool {
         match self.mode {
             ViewMode::FileBrowser => {
-                true// Exit application
+                true // Exit application
             }
             ViewMode::LayerOverview => {
                 if self.mlt_files.is_empty() {
@@ -249,28 +232,32 @@ impl App {
             }
         }
     }
-    
+
     fn get_selected_item(&self) -> &TreeItem {
         &self.tree_items[self.selected_index]
     }
-    
+
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
         // Simple hit test: find feature whose bounding box contains the point
         let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02; // 2% of view size
-        
+
         for (idx, item) in self.tree_items.iter().enumerate() {
-            if let TreeItem::Feature { layer_index, feature_index } = item {
+            if let TreeItem::Feature {
+                layer_index,
+                feature_index,
+            } = item
+            {
                 if let OwnedLayer::Tag01(l) = &self.layers[*layer_index] {
                     if let OwnedGeometry::Decoded(geom) = &l.geometry {
                         let verts = geom.vertices.as_deref().unwrap_or(&[]);
-                        
+
                         // Check if any vertex is near the cursor
                         for i in (0..(verts.len() / 2)).map(|i| i * 2) {
                             let x = f64::from(verts[i]);
                             let y = f64::from(verts[i + 1]);
                             let dx = (x - canvas_x).abs();
                             let dy = (y - canvas_y).abs();
-                            
+
                             if dx < threshold && dy < threshold {
                                 // Check if this vertex belongs to our feature
                                 if Self::vertex_belongs_to_feature(geom, *feature_index, i / 2) {
@@ -285,13 +272,17 @@ impl App {
         }
         self.hovered_item = None;
     }
-    
-    fn vertex_belongs_to_feature(_geom: &DecodedGeometry, _feature_idx: usize, _vertex_idx: usize) -> bool {
+
+    fn vertex_belongs_to_feature(
+        _geom: &DecodedGeometry,
+        _feature_idx: usize,
+        _vertex_idx: usize,
+    ) -> bool {
         // Simplified: assume all vertices in range belong to feature
         // In a full implementation, we'd check geometry_offsets, part_offsets, etc.
         true
     }
-    
+
     /// Get the extent from the first layer, or use a default
     fn get_extent(&self) -> f64 {
         self.layers
@@ -305,17 +296,17 @@ impl App {
             })
             .unwrap_or(4096.0)
     }
-    
+
     /// Calculate the bounding box for all geometries to be displayed
     fn calculate_bounds(&self) -> (f64, f64, f64, f64) {
         let selected_item = self.get_selected_item();
         let extent = self.get_extent();
-        
+
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
         let mut max_x = f64::NEG_INFINITY;
         let mut max_y = f64::NEG_INFINITY;
-        
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             match layer {
                 OwnedLayer::Tag01(l) => {
@@ -325,7 +316,7 @@ impl App {
                             TreeItem::Layer { index } => *index == layer_idx,
                             TreeItem::Feature { layer_index, .. } => *layer_index == layer_idx,
                         };
-                        
+
                         if should_include_layer {
                             let verts = geom.vertices.as_deref().unwrap_or(&[]);
                             for i in (0..verts.len()).step_by(2) {
@@ -342,25 +333,65 @@ impl App {
                 OwnedLayer::Unknown(_) => {}
             }
         }
-        
+
         // Ensure bounds include the extent
         min_x = min_x.min(0.0);
         min_y = min_y.min(0.0);
         max_x = max_x.max(extent);
         max_y = max_y.max(extent);
-        
+
         // Add some padding
         let padding_x = (max_x - min_x) * 0.1;
         let padding_y = (max_y - min_y) * 0.1;
-        
-        (min_x - padding_x, min_y - padding_y, max_x + padding_x, max_y + padding_y)
+
+        (
+            min_x - padding_x,
+            min_y - padding_y,
+            max_x + padding_x,
+            max_y + padding_y,
+        )
     }
+}
+
+/// Helper function to convert borrowed layers to owned layers
+fn convert_to_owned_layers(
+    layers: &[Layer<'_>],
+) -> Result<Vec<OwnedLayer>, Box<dyn std::error::Error>> {
+    let mut owned_layers = Vec::new();
+    for layer in layers {
+        if let Layer::Tag01(l) = layer {
+            let owned_layer = mlt_nom::v01::OwnedLayer01 {
+                name: l.name.to_string(),
+                extent: l.extent,
+                id: match &l.id {
+                    mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
+                    mlt_nom::v01::Id::None | mlt_nom::v01::Id::Raw(_) => {
+                        mlt_nom::v01::OwnedId::None
+                    }
+                },
+                geometry: match &l.geometry {
+                    mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
+                    mlt_nom::v01::Geometry::Raw(_) => return Err("Geometry not decoded".into()),
+                },
+                properties: l
+                    .properties
+                    .iter()
+                    .try_fold(Vec::new(), |mut acc, p| match p {
+                        mlt_nom::v01::Property::Decoded(d) => {
+                            acc.push(mlt_nom::v01::OwnedProperty::Decoded(d.clone()));
+                            Ok(acc)
+                        }
+                        mlt_nom::v01::Property::Raw(_) => Err("Property not decoded"),
+                    })?,
+            };
+            owned_layers.push(OwnedLayer::Tag01(owned_layer));
+        }
+    }
+    Ok(owned_layers)
 }
 
 /// Recursively find all .mlt files in a directory
 fn find_mlt_files(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let mut mlt_files = Vec::new();
-    
     fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
@@ -375,7 +406,8 @@ fn find_mlt_files(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>
         }
         Ok(())
     }
-    
+
+    let mut mlt_files = Vec::new();
     visit_dir(dir, &mut mlt_files)?;
     mlt_files.sort();
     Ok(mlt_files)
@@ -395,39 +427,15 @@ pub fn run_with_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         // Single file mode
         let buffer = fs::read(path)?;
         let mut layers = parse_layers(&buffer)?;
-        
+
         // Decode all layers first
         for layer in &mut layers {
             layer.decode_all()?;
         }
-        
-        // Convert to owned by manually constructing
-        let mut owned_layers = Vec::new();
-        for layer in &layers {
-            if let Layer::Tag01(l) = layer {
-                let owned_layer = mlt_nom::v01::OwnedLayer01 {
-                    name: l.name.to_string(),
-                    extent: l.extent,
-                    id: match &l.id {
-                        mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
-                        mlt_nom::v01::Id::None => mlt_nom::v01::OwnedId::None,
-                        _ => mlt_nom::v01::OwnedId::None,
-                    },
-                    geometry: match &l.geometry {
-                        mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
-                        _ => return Err("Geometry not decoded".into()),
-                    },
-                    properties: l.properties.iter().map(|p| {
-                        match p {
-                            mlt_nom::v01::Property::Decoded(d) => mlt_nom::v01::OwnedProperty::Decoded(d.clone()),
-                            _ => panic!("Property not decoded"),
-                        }
-                    }).collect(),
-                };
-                owned_layers.push(OwnedLayer::Tag01(owned_layer));
-            }
-        }
-        
+
+        // Convert to owned by using the helper function
+        let owned_layers = convert_to_owned_layers(&layers)?;
+
         let mut app = App::new_single_file(owned_layers, Some(path.to_path_buf()));
         app.build_tree_items();
         run_app(app)
@@ -448,7 +456,7 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
         // For now, just return an error
         return Err("Direct layer conversion not supported. Use run_with_path instead.".into());
     }
-    
+
     let mut app = App::new_single_file(owned_layers, None);
     app.build_tree_items();
     run_app(app)
@@ -462,9 +470,9 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    
+
     let mut map_area: Option<Rect> = None;
-    
+
     loop {
         terminal.draw(|f| {
             match app.mode {
@@ -474,24 +482,21 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                 ViewMode::LayerOverview | ViewMode::DetailMode => {
                     let chunks = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([
-                            Constraint::Percentage(30),
-                            Constraint::Percentage(70),
-                        ])
+                        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
                         .split(f.area());
-                    
+
                     // Render tree panel
                     render_tree_panel(f, chunks[0], &mut app);
-                    
+
                     // Render map panel
                     render_map_panel(f, chunks[1], &app);
-                    
+
                     // Store map area for mouse event handling
                     map_area = Some(chunks[1]);
                 }
             }
         })?;
-        
+
         // Handle input
         if event::poll(std::time::Duration::from_millis(100))? {
             match event::read()? {
@@ -516,20 +521,23 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                 Event::Mouse(mouse) => {
                     if let MouseEventKind::Moved = mouse.kind {
                         app.mouse_pos = Some((mouse.column, mouse.row));
-                        
+
                         // Convert screen coordinates to canvas coordinates
                         if let Some(area) = map_area {
-                            if mouse.column >= area.x && mouse.column < area.x + area.width
-                                && mouse.row >= area.y && mouse.row < area.y + area.height
+                            if mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
                             {
                                 let bounds = app.calculate_bounds();
-                                let rel_x = f64::from(mouse.column - area.x) / f64::from(area.width);
+                                let rel_x =
+                                    f64::from(mouse.column - area.x) / f64::from(area.width);
                                 let rel_y = f64::from(mouse.row - area.y) / f64::from(area.height);
-                                
+
                                 // Map to canvas coordinates (accounting for canvas coordinate system)
                                 let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
                                 let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1); // Flip Y
-                                
+
                                 app.find_hovered_feature(canvas_x, canvas_y, bounds);
                             } else {
                                 app.hovered_item = None;
@@ -541,84 +549,95 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
-    
+
     Ok(())
 }
 
-fn render_file_browser(
-    f: &mut ratatui::Frame<'_>,
-    app: &mut App,
-) {
-    let items: Vec<ListItem> = app.mlt_files.iter().enumerate().map(|(idx, path)| {
-        let name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
-        let parent = path.parent()
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
-        
-        let content = if parent.is_empty() {
-            name.to_string()
-        } else {
-            format!("{parent}/{name}")
-        };
-        
-        let style = if idx == app.selected_file_index {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        
-        ListItem::new(Line::from(Span::styled(content, style)))
-    }).collect();
-    
-    let list = List::new(items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(format!("MLT Files ({} found) - ↑/↓ to navigate, Enter to open, q to quit", app.mlt_files.len())));
-    
+fn render_file_browser(f: &mut ratatui::Frame<'_>, app: &mut App) {
+    let items: Vec<ListItem> = app
+        .mlt_files
+        .iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+            let content = if parent.is_empty() {
+                name.to_string()
+            } else {
+                format!("{parent}/{name}")
+            };
+
+            let style = if idx == app.selected_file_index {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(Line::from(Span::styled(content, style)))
+        })
+        .collect();
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        "MLT Files ({} found) - ↑/↓ to navigate, Enter to open, q to quit",
+        app.mlt_files.len()
+    )));
+
     f.render_stateful_widget(list, f.area(), &mut app.file_list_state);
 }
 
-fn render_tree_panel(
-    f: &mut ratatui::Frame<'_>,
-    area: Rect,
-    app: &mut App,
-) {
-    let items: Vec<ListItem> = app.tree_items.iter().enumerate().map(|(idx, item)| {
-        let content = match item {
-            TreeItem::AllLayers => "All Layers".to_string(),
-            TreeItem::Layer { index } => {
-                let layer = &app.layers[*index];
-                match layer {
-                    OwnedLayer::Tag01(l) => format!("  Layer: {}", l.name),
-                    OwnedLayer::Unknown(_) => format!("  Layer {index}"),
+fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let items: Vec<ListItem> = app
+        .tree_items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let content = match item {
+                TreeItem::AllLayers => "All Layers".to_string(),
+                TreeItem::Layer { index } => {
+                    let layer = &app.layers[*index];
+                    match layer {
+                        OwnedLayer::Tag01(l) => format!("  Layer: {}", l.name),
+                        OwnedLayer::Unknown(_) => format!("  Layer {index}"),
+                    }
                 }
-            }
-            TreeItem::Feature { feature_index, .. } => {
-                format!("    Feature {feature_index}")
-            }
-        };
-        
-        let style = if idx == app.selected_index {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if Some(idx) == app.hovered_item {
-            Style::default().fg(Color::LightGreen).add_modifier(Modifier::UNDERLINED)
-        } else {
-            Style::default()
-        };
-        
-        ListItem::new(Line::from(Span::styled(content, style)))
-    }).collect();
-    
+                TreeItem::Feature { feature_index, .. } => {
+                    format!("    Feature {feature_index}")
+                }
+            };
+
+            let style = if idx == app.selected_index {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if Some(idx) == app.hovered_item {
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default()
+            };
+
+            ListItem::new(Line::from(Span::styled(content, style)))
+        })
+        .collect();
+
     let title = match app.mode {
         ViewMode::LayerOverview => {
-            let filename = app.current_file.as_ref()
+            let filename = app
+                .current_file
+                .as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
@@ -627,30 +646,21 @@ fn render_tree_panel(
         ViewMode::DetailMode => {
             "Layers & Features (↑/↓ to navigate, Esc to go back, q to quit)".to_string()
         }
-        _ => "Layers & Features".to_string(),
+        ViewMode::FileBrowser => "Layers & Features".to_string(),
     };
-    
-    let list = List::new(items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(title));
-    
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_map_panel(
-    f: &mut ratatui::Frame<'_>,
-    area: Rect,
-    app: &App,
-) {
+fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let selected_item = app.get_selected_item();
     let extent = app.get_extent();
     let (x_min, y_min, x_max, y_max) = app.calculate_bounds();
-    
+
     let canvas = Canvas::default()
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title("Map View"))
+        .block(Block::default().borders(Borders::ALL).title("Map View"))
         .x_bounds([x_min, x_max])
         .y_bounds([y_min, y_max])
         .paint(|ctx| {
@@ -662,7 +672,7 @@ fn render_map_panel(
                 height: extent,
                 color: Color::DarkGray,
             });
-            
+
             // Draw geometries
             for (layer_idx, layer) in app.layers.iter().enumerate() {
                 if let OwnedLayer::Tag01(l) = layer {
@@ -672,15 +682,22 @@ fn render_map_panel(
                             TreeItem::Layer { index } => *index == layer_idx,
                             TreeItem::Feature { layer_index, .. } => *layer_index == layer_idx,
                         };
-                        
+
                         if should_include_layer {
-                            draw_geometry(ctx, geom, selected_item, layer_idx, app.hovered_item.as_ref(), &app.tree_items);
+                            draw_geometry(
+                                ctx,
+                                geom,
+                                selected_item,
+                                layer_idx,
+                                app.hovered_item.as_ref(),
+                                &app.tree_items,
+                            );
                         }
                     }
                 }
             }
         });
-    
+
     f.render_widget(canvas, area);
 }
 
@@ -726,7 +743,7 @@ fn draw_geometry(
     tree_items: &[TreeItem],
 ) {
     let verts = geom.vertices.as_deref().unwrap_or(&[]);
-    
+
     let v = |idx: usize| -> Option<[f64; 2]> {
         if idx * 2 + 1 < verts.len() {
             Some([f64::from(verts[idx * 2]), f64::from(verts[idx * 2 + 1])])
@@ -734,37 +751,44 @@ fn draw_geometry(
             None
         }
     };
-    
+
     for (feat_idx, geom_type) in geom.vector_types.iter().enumerate() {
         let should_include_feature = match selected_item {
             TreeItem::AllLayers | TreeItem::Layer { .. } => true,
-            TreeItem::Feature { layer_index, feature_index } => {
-                *layer_index == layer_idx && *feature_index == feat_idx
-            }
+            TreeItem::Feature {
+                layer_index,
+                feature_index,
+            } => *layer_index == layer_idx && *feature_index == feat_idx,
         };
-        
+
         if !should_include_feature {
             continue;
         }
-        
+
         // Check if this feature is hovered
         let is_hovered = hovered_item.is_some_and(|&h_idx| {
-            matches!(&tree_items[h_idx], TreeItem::Feature { layer_index, feature_index } 
+            matches!(&tree_items[h_idx], TreeItem::Feature { layer_index, feature_index }
                 if *layer_index == layer_idx && *feature_index == feat_idx)
         });
-        
+
         // Determine color based on selection state and geometry type
         let base_color = get_geometry_type_color(*geom_type);
-        let color = if matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
+        let color = if matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
+        {
             Color::Yellow // Selected feature
         } else if is_hovered {
             Color::White // Hovered feature
         } else {
             base_color // Color by geometry type
         };
-        
+
         // Get the geometry coordinate ranges based on the type
-        match (geom_type, &geom.geometry_offsets, &geom.part_offsets, &geom.ring_offsets) {
+        match (
+            geom_type,
+            &geom.geometry_offsets,
+            &geom.part_offsets,
+            &geom.ring_offsets,
+        ) {
             (GeometryType::Point, Some(g), Some(p), Some(r)) => {
                 let idx = r[p[g[feat_idx] as usize] as usize] as usize;
                 if let Some([x, y]) = v(idx) {
@@ -815,9 +839,11 @@ fn draw_geometry(
                 for ring_idx in ring_start..ring_end {
                     let start = r[ring_idx] as usize;
                     let end = r[ring_idx + 1] as usize;
-                    
+
                     // Use winding order to determine color for polygons
-                    let ring_color = if is_hovered || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
+                    let ring_color = if is_hovered
+                        || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
+                    {
                         color // Keep override colors
                     } else {
                         let is_ccw = calculate_winding_order(start, end, &v);
@@ -827,7 +853,7 @@ fn draw_geometry(
                             Color::Red // CW - typically hole
                         }
                     };
-                    
+
                     draw_polygon_ring(ctx, start, end, &v, ring_color);
                 }
             }
@@ -857,9 +883,11 @@ fn draw_geometry(
                     for ring_idx in rs..re {
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
-                        
+
                         // Use winding order to determine color for polygons
-                        let ring_color = if is_hovered || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
+                        let ring_color = if is_hovered
+                            || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
+                        {
                             color // Keep override colors
                         } else {
                             let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
@@ -869,7 +897,7 @@ fn draw_geometry(
                                 Color::Red // CW - typically hole
                             }
                         };
-                        
+
                         draw_polygon_ring(ctx, ring_start, ring_end, &v, ring_color);
                     }
                 }
