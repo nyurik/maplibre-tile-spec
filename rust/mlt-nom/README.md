@@ -32,7 +32,7 @@ The `mlt-nom` binary provides several commands for working with MLT files:
 ### Commands
 
 * **`dump`** - Parse an MLT file and dump raw layer data without decoding
-* **`decode`** - Parse an MLT file, decode all layers, and dump the result (supports text and GeoJSON output)
+* **`decode`** - Parse an MLT file, decode all layers, and dump the result (supports text and `GeoJSON` output)
 * **`visualize`** - Interactive TUI visualizer for MLT files
 
 ### Visualizer
