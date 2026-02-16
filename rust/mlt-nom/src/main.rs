@@ -45,12 +45,13 @@ enum OutputFormat {
 
 #[derive(Args)]
 struct LsArgs {
-    /// Path to a .mlt file or directory
-    path: PathBuf,
+    /// Paths to .mlt files or directories
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
 
-    /// Recursively traverse directories
-    #[arg(short, long)]
-    recursive: bool,
+    /// Disable recursive directory traversal
+    #[arg(long)]
+    no_recursive: bool,
 
     /// Output format (table or json)
     #[arg(short, long, default_value = "table", value_enum)]
@@ -106,31 +107,47 @@ fn dump(args: &DumpArgs, decode: bool) -> Result<(), Box<dyn std::error::Error>>
 #[derive(serde::Serialize, Debug)]
 struct MltFileInfo {
     path: String,
+    size: usize,
+    decoded_size: usize,
+    encoding_pct: f64,
+    gzipped_size: usize,
+    gzip_pct: f64,
     layers: usize,
     features: usize,
     streams: usize,
-    decompressed_size: usize,
-    compressed_size: usize,
-    gzip_savings_pct: f64,
     compressions: String,
     geometries: String,
 }
 
 fn ls(args: &LsArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let base_path = &args.path;
-    let files = collect_mlt_files(base_path, args.recursive)?;
+    let recursive = !args.no_recursive;
+    let mut all_files = Vec::new();
 
-    if files.is_empty() {
+    // Collect files from all provided paths
+    for path in &args.paths {
+        let files = collect_mlt_files(path, recursive)?;
+        all_files.extend(files);
+    }
+
+    if all_files.is_empty() {
         eprintln!("No .mlt files found");
         return Ok(());
     }
+
+    // Determine base path for relative path calculation
+    // Use current directory if multiple paths or use the single path
+    let base_path = if args.paths.len() == 1 {
+        &args.paths[0]
+    } else {
+        Path::new(".")
+    };
 
     // Process files in parallel
     let infos: Vec<_> = {
         #[cfg(feature = "cli")]
         {
             use rayon::prelude::*;
-            files
+            all_files
                 .par_iter()
                 .filter_map(|path| match analyze_mlt_file(path, base_path) {
                     Ok(info) => Some(info),
@@ -143,7 +160,7 @@ fn ls(args: &LsArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(feature = "cli"))]
         {
-            files
+            all_files
                 .iter()
                 .filter_map(|path| match analyze_mlt_file(path, base_path) {
                     Ok(info) => Some(info),
@@ -303,14 +320,8 @@ fn analyze_mlt_file(
         }
     }
 
-    // Calculate gzip compression savings
+    // Calculate gzip size
     let gzip_size = estimate_gzip_size(&buffer)?;
-    #[allow(clippy::cast_precision_loss)]
-    let gzip_savings_pct = if original_size > 0 && gzip_size <= original_size {
-        ((original_size - gzip_size) as f64 / original_size as f64) * 100.0
-    } else {
-        0.0
-    };
 
     // Format compression and geometry lists with abbreviations
     let compressions_str = format_compressions(&compressions);
@@ -331,14 +342,31 @@ fn analyze_mlt_file(
             .to_string()
     };
 
+    // Calculate percentages
+    #[allow(clippy::cast_precision_loss)]
+    let encoding_pct = if decompressed_size > 0 {
+        (original_size as f64 / decompressed_size as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    #[allow(clippy::cast_precision_loss)]
+    let gzip_pct = if original_size > 0 {
+        (gzip_size as f64 / original_size as f64) * 100.0
+    } else {
+        0.0
+    };
+
     Ok(MltFileInfo {
         path: rel_path,
+        size: original_size,
+        decoded_size: decompressed_size,
+        encoding_pct,
+        gzipped_size: gzip_size,
+        gzip_pct,
         layers: layer_count,
         features: feature_count,
         streams: stream_count,
-        decompressed_size,
-        compressed_size: original_size,
-        gzip_savings_pct,
         compressions: compressions_str,
         geometries: geometries_str,
     })
@@ -403,20 +431,29 @@ fn format_geometries(geometries: &HashSet<String>) -> String {
 fn print_table(infos: &[MltFileInfo]) {
     #[cfg(feature = "cli")]
     {
-        use comfy_table::{Attribute, Cell, Table, presets::UTF8_FULL};
+        use comfy_table::{Attribute, Cell, Table};
 
         let mut table = Table::new();
-        table.load_preset(UTF8_FULL);
+
+        // Load NOTHING preset to start clean
+        table.load_preset(comfy_table::presets::NOTHING);
+        // Set column separators to |
+        table.set_style(comfy_table::TableComponent::VerticalLines, '|');
+        // Set header separator
+        table.set_style(comfy_table::TableComponent::HeaderLines, '-');
+        table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '-');
 
         // Add header
         table.set_header(vec![
             Cell::new("File").add_attribute(Attribute::Bold),
+            Cell::new("Size").add_attribute(Attribute::Bold),
+            Cell::new("Decoded Size").add_attribute(Attribute::Bold),
+            Cell::new("Encoding %").add_attribute(Attribute::Bold),
+            Cell::new("Gzipped Size").add_attribute(Attribute::Bold),
+            Cell::new("Gzip %").add_attribute(Attribute::Bold),
             Cell::new("Layers").add_attribute(Attribute::Bold),
             Cell::new("Features").add_attribute(Attribute::Bold),
             Cell::new("Streams").add_attribute(Attribute::Bold),
-            Cell::new("Decomp. Size").add_attribute(Attribute::Bold),
-            Cell::new("Comp. Size").add_attribute(Attribute::Bold),
-            Cell::new("Gzip%").add_attribute(Attribute::Bold),
             Cell::new("Compressions").add_attribute(Attribute::Bold),
             Cell::new("Geometries").add_attribute(Attribute::Bold),
         ]);
@@ -425,12 +462,14 @@ fn print_table(infos: &[MltFileInfo]) {
         for info in infos {
             table.add_row(vec![
                 Cell::new(&info.path),
+                Cell::new(info.size.to_string()),
+                Cell::new(info.decoded_size.to_string()),
+                Cell::new(format!("{:.1}", info.encoding_pct)),
+                Cell::new(info.gzipped_size.to_string()),
+                Cell::new(format!("{:.1}", info.gzip_pct)),
                 Cell::new(info.layers),
                 Cell::new(info.features),
                 Cell::new(info.streams),
-                Cell::new(format_size(info.decompressed_size)),
-                Cell::new(format_size(info.compressed_size)),
-                Cell::new(format!("{:.1}", info.gzip_savings_pct)),
                 Cell::new(&info.compressions),
                 Cell::new(&info.geometries),
             ]);
@@ -443,16 +482,5 @@ fn print_table(infos: &[MltFileInfo]) {
         for info in infos {
             println!("{:?}", info);
         }
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn format_size(size: usize) -> String {
-    if size < 1024 {
-        format!("{size}B")
-    } else if size < 1024 * 1024 {
-        format!("{:.1}KB", size as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", size as f64 / (1024.0 * 1024.0))
     }
 }
