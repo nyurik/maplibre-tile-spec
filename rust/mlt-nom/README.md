@@ -40,8 +40,19 @@ The `mlt-nom` binary provides several commands for working with MLT files:
 The visualizer command provides an interactive terminal-based UI for exploring MLT files:
 
 ```bash
+# Visualize a single MLT file
 cargo run -- visualize path/to/file.mlt
+
+# Browse and visualize all MLT files in a directory (recursive)
+cargo run -- visualize path/to/directory
 ```
+
+**Directory Mode**:
+- Lists all `.mlt` files found recursively in the directory
+- Use `↑`/`↓` to navigate the file list
+- Press `Enter` to open and visualize a file
+- Press `Esc` to go back to file list
+- Press `q` to quit
 
 Features:
 - **Tree View Panel (left)**: Browse layers and features in a hierarchical tree
@@ -53,7 +64,7 @@ Features:
   - Shows the extent boundary as a thin gray rectangle
   - **Color coding by geometry type**:
     - Points: Magenta (multi-point: light magenta)
-    - LineStrings: Cyan (multi-linestring: light cyan)
+    - `LineStrings`: Cyan (multi-linestring: light cyan)
     - Polygons: Blue/Red based on winding order (multi-polygon: same)
   - **Polygon winding order visualization**:
     - Blue: Counter-clockwise rings (typically outer rings)
@@ -66,4 +77,6 @@ Features:
 - **Keyboard Navigation**:
   - `↑`/`k` - Move selection up
   - `↓`/`j` - Move selection down
-  - `q`/`Esc` - Quit the visualizer
+  - `Enter` - In layer overview mode, switch to detail mode; In file browser, open selected file
+  - `Esc` - Go back (detail → overview → file list) or quit if at top level
+  - `q` - Quit the visualizer

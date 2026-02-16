@@ -39,8 +39,8 @@ struct DumpArgs {
 #[cfg(feature = "tui")]
 #[derive(Args)]
 struct VisualizeArgs {
-    /// Path to the MLT file
-    file: PathBuf,
+    /// Path to the MLT file or directory
+    path: PathBuf,
 }
 
 #[derive(Clone, Default, ValueEnum)]
@@ -93,15 +93,6 @@ fn dump(args: &DumpArgs, decode: bool) -> Result<(), Box<dyn std::error::Error>>
 
 #[cfg(feature = "tui")]
 fn visualize(args: &VisualizeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let buffer = fs::read(&args.file)?;
-    let mut layers = parse_layers(&buffer)?;
-    
-    // Decode all layers before visualizing
-    for layer in &mut layers {
-        layer.decode_all()?;
-    }
-    
-    visualizer::run(&layers)?;
-    
+    visualizer::run_with_path(&args.path)?;
     Ok(())
 }

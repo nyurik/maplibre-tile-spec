@@ -1,6 +1,8 @@
 //! TUI visualizer for MLT files using ratatui
 
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::execute;
@@ -14,7 +16,19 @@ use ratatui::widgets::canvas::Canvas;
 use ratatui::Terminal;
 
 use mlt_nom::layer::Layer;
-use mlt_nom::v01::{DecodedGeometry, Geometry, GeometryType};
+use mlt_nom::v01::{DecodedGeometry, GeometryType, OwnedGeometry};
+use mlt_nom::{parse_layers, OwnedLayer};
+
+/// Visualization mode
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ViewMode {
+    /// File browser mode - select from list of MLT files
+    FileBrowser,
+    /// Layer overview mode - all layers shown
+    LayerOverview,
+    /// Detail mode - individual features visible
+    DetailMode,
+}
 
 /// Represents a selectable item in the tree view
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +39,16 @@ enum TreeItem {
 }
 
 /// Application state for the visualizer
-struct App<'a> {
-    layers: &'a [Layer<'a>],
+struct App {
+    mode: ViewMode,
+    // File browser state
+    mlt_files: Vec<PathBuf>,
+    selected_file_index: usize,
+    file_list_state: ListState,
+    // Current file data
+    current_file: Option<PathBuf>,
+    layers: Vec<OwnedLayer>,
+    // Layer/feature state
     tree_items: Vec<TreeItem>,
     selected_index: usize,
     list_state: ListState,
@@ -34,31 +56,37 @@ struct App<'a> {
     mouse_pos: Option<(u16, u16)>,
 }
 
-impl<'a> App<'a> {
-    fn new(layers: &'a [Layer<'a>]) -> Self {
-        let mut tree_items = vec![TreeItem::AllLayers];
+impl App {
+    fn new_file_browser(mlt_files: Vec<PathBuf>) -> Self {
+        let mut file_list_state = ListState::default();
+        file_list_state.select(Some(0));
         
-        // Build tree structure
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            if let Some(l) = layer.as_layer01() {
-                tree_items.push(TreeItem::Layer { index: layer_idx });
-                
-                // Get feature count from geometry
-                if let Geometry::Decoded(geom) = &l.geometry {
-                    for feature_idx in 0..geom.vector_types.len() {
-                        tree_items.push(TreeItem::Feature {
-                            layer_index: layer_idx,
-                            feature_index: feature_idx,
-                        });
-                    }
-                }
-            }
+        Self {
+            mode: ViewMode::FileBrowser,
+            mlt_files,
+            selected_file_index: 0,
+            file_list_state,
+            current_file: None,
+            layers: Vec::new(),
+            tree_items: Vec::new(),
+            selected_index: 0,
+            list_state: ListState::default(),
+            hovered_item: None,
+            mouse_pos: None,
         }
-        
+    }
+    
+    fn new_single_file(layers: Vec<OwnedLayer>, file_path: Option<PathBuf>) -> Self {
+        let tree_items = vec![TreeItem::AllLayers];
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         
         Self {
+            mode: ViewMode::LayerOverview,
+            mlt_files: Vec::new(),
+            selected_file_index: 0,
+            file_list_state: ListState::default(),
+            current_file: file_path,
             layers,
             tree_items,
             selected_index: 0,
@@ -68,17 +96,157 @@ impl<'a> App<'a> {
         }
     }
     
+    fn load_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer = fs::read(path)?;
+        let mut layers = parse_layers(&buffer)?;
+        
+        // Decode all layers first
+        for layer in &mut layers {
+            layer.decode_all()?;
+        }
+        
+        // Clear existing layers and manually construct owned versions
+        self.layers.clear();
+        
+        for layer in &layers {
+            if let Layer::Tag01(l) = layer {
+                let owned_layer = mlt_nom::v01::OwnedLayer01 {
+                    name: l.name.to_string(),
+                    extent: l.extent,
+                    id: match &l.id {
+                        mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
+                        mlt_nom::v01::Id::None => mlt_nom::v01::OwnedId::None,
+                        _ => mlt_nom::v01::OwnedId::None, // Raw shouldn't happen after decode
+                    },
+                    geometry: match &l.geometry {
+                        mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
+                        _ => return Err("Geometry not decoded".into()),
+                    },
+                    properties: l.properties.iter().map(|p| {
+                        match p {
+                            mlt_nom::v01::Property::Decoded(d) => mlt_nom::v01::OwnedProperty::Decoded(d.clone()),
+                            _ => panic!("Property not decoded"),
+                        }
+                    }).collect(),
+                };
+                self.layers.push(OwnedLayer::Tag01(owned_layer));
+            }
+        }
+        
+        self.current_file = Some(path.to_path_buf());
+        self.mode = ViewMode::LayerOverview;
+        self.build_tree_items();
+        self.selected_index = 0;
+        self.list_state.select(Some(0));
+        
+        Ok(())
+    }
+    
+    fn build_tree_items(&mut self) {
+        self.tree_items.clear();
+        
+        if self.mode == ViewMode::LayerOverview {
+            self.tree_items.push(TreeItem::AllLayers);
+        } else if self.mode == ViewMode::DetailMode {
+            self.tree_items.push(TreeItem::AllLayers);
+            
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                match layer {
+                    OwnedLayer::Tag01(l) => {
+                        self.tree_items.push(TreeItem::Layer { index: layer_idx });
+                        
+                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                            for feature_idx in 0..geom.vector_types.len() {
+                                self.tree_items.push(TreeItem::Feature {
+                                    layer_index: layer_idx,
+                                    feature_index: feature_idx,
+                                });
+                            }
+                        }
+                    }
+                    OwnedLayer::Unknown(_) => {}
+                }
+            }
+        }
+    }
+    
     fn move_up(&mut self) {
-        if self.selected_index > 0 {
-            self.selected_index -= 1;
-            self.list_state.select(Some(self.selected_index));
+        match self.mode {
+            ViewMode::FileBrowser => {
+                if self.selected_file_index > 0 {
+                    self.selected_file_index -= 1;
+                    self.file_list_state.select(Some(self.selected_file_index));
+                }
+            }
+            ViewMode::LayerOverview | ViewMode::DetailMode => {
+                if self.selected_index > 0 {
+                    self.selected_index -= 1;
+                    self.list_state.select(Some(self.selected_index));
+                }
+            }
         }
     }
     
     fn move_down(&mut self) {
-        if self.selected_index < self.tree_items.len() - 1 {
-            self.selected_index += 1;
-            self.list_state.select(Some(self.selected_index));
+        match self.mode {
+            ViewMode::FileBrowser => {
+                if self.selected_file_index < self.mlt_files.len().saturating_sub(1) {
+                    self.selected_file_index += 1;
+                    self.file_list_state.select(Some(self.selected_file_index));
+                }
+            }
+            ViewMode::LayerOverview | ViewMode::DetailMode => {
+                if self.selected_index < self.tree_items.len().saturating_sub(1) {
+                    self.selected_index += 1;
+                    self.list_state.select(Some(self.selected_index));
+                }
+            }
+        }
+    }
+    
+    fn handle_enter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                if let Some(file_path) = self.mlt_files.get(self.selected_file_index).cloned() {
+                    self.load_file(&file_path)?;
+                }
+            }
+            ViewMode::LayerOverview => {
+                self.mode = ViewMode::DetailMode;
+                self.build_tree_items();
+                self.selected_index = 0;
+                self.list_state.select(Some(0));
+            }
+            ViewMode::DetailMode => {
+                // Already in detail mode, nothing to do
+            }
+        }
+        Ok(())
+    }
+    
+    fn handle_escape(&mut self) -> bool {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                true// Exit application
+            }
+            ViewMode::LayerOverview => {
+                if self.mlt_files.is_empty() {
+                    true // Exit if no file list
+                } else {
+                    self.mode = ViewMode::FileBrowser;
+                    self.layers.clear();
+                    self.tree_items.clear();
+                    self.current_file = None;
+                    false
+                }
+            }
+            ViewMode::DetailMode => {
+                self.mode = ViewMode::LayerOverview;
+                self.build_tree_items();
+                self.selected_index = 0;
+                self.list_state.select(Some(0));
+                false
+            }
         }
     }
     
@@ -92,8 +260,8 @@ impl<'a> App<'a> {
         
         for (idx, item) in self.tree_items.iter().enumerate() {
             if let TreeItem::Feature { layer_index, feature_index } = item {
-                if let Some(l) = self.layers[*layer_index].as_layer01() {
-                    if let Geometry::Decoded(geom) = &l.geometry {
+                if let OwnedLayer::Tag01(l) = &self.layers[*layer_index] {
+                    if let OwnedGeometry::Decoded(geom) = &l.geometry {
                         let verts = geom.vertices.as_deref().unwrap_or(&[]);
                         
                         // Check if any vertex is near the cursor
@@ -128,8 +296,14 @@ impl<'a> App<'a> {
     fn get_extent(&self) -> f64 {
         self.layers
             .iter()
-            .find_map(|l| l.as_layer01())
-            .map_or(4096.0, |l| f64::from(l.extent))
+            .find_map(|l| {
+                if let OwnedLayer::Tag01(layer) = l {
+                    Some(f64::from(layer.extent))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(4096.0)
     }
     
     /// Calculate the bounding box for all geometries to be displayed
@@ -143,26 +317,29 @@ impl<'a> App<'a> {
         let mut max_y = f64::NEG_INFINITY;
         
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            if let Some(l) = layer.as_layer01() {
-                if let Geometry::Decoded(geom) = &l.geometry {
-                    let should_include_layer = match selected_item {
-                        TreeItem::AllLayers => true,
-                        TreeItem::Layer { index } => *index == layer_idx,
-                        TreeItem::Feature { layer_index, .. } => *layer_index == layer_idx,
-                    };
-                    
-                    if should_include_layer {
-                        let verts = geom.vertices.as_deref().unwrap_or(&[]);
-                        for i in (0..verts.len()).step_by(2) {
-                            let x = f64::from(verts[i]);
-                            let y = f64::from(verts[i + 1]);
-                            min_x = min_x.min(x);
-                            min_y = min_y.min(y);
-                            max_x = max_x.max(x);
-                            max_y = max_y.max(y);
+            match layer {
+                OwnedLayer::Tag01(l) => {
+                    if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                        let should_include_layer = match selected_item {
+                            TreeItem::AllLayers => true,
+                            TreeItem::Layer { index } => *index == layer_idx,
+                            TreeItem::Feature { layer_index, .. } => *layer_index == layer_idx,
+                        };
+                        
+                        if should_include_layer {
+                            let verts = geom.vertices.as_deref().unwrap_or(&[]);
+                            for i in (0..verts.len()).step_by(2) {
+                                let x = f64::from(verts[i]);
+                                let y = f64::from(verts[i + 1]);
+                                min_x = min_x.min(x);
+                                min_y = min_y.min(y);
+                                max_x = max_x.max(x);
+                                max_y = max_y.max(y);
+                            }
                         }
                     }
                 }
+                OwnedLayer::Unknown(_) => {}
             }
         }
         
@@ -180,8 +357,105 @@ impl<'a> App<'a> {
     }
 }
 
-/// Run the TUI application
+/// Recursively find all .mlt files in a directory
+fn find_mlt_files(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut mlt_files = Vec::new();
+    
+    fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+        if dir.is_dir() {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    visit_dir(&path, files)?;
+                } else if path.extension().and_then(|s| s.to_str()) == Some("mlt") {
+                    files.push(path);
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    visit_dir(dir, &mut mlt_files)?;
+    mlt_files.sort();
+    Ok(mlt_files)
+}
+
+/// Run the TUI application with a path (file or directory)
+pub fn run_with_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path.is_dir() {
+        // Directory mode - browse files
+        let mlt_files = find_mlt_files(path)?;
+        if mlt_files.is_empty() {
+            return Err("No .mlt files found in directory".into());
+        }
+        let app = App::new_file_browser(mlt_files);
+        run_app(app)
+    } else if path.is_file() {
+        // Single file mode
+        let buffer = fs::read(path)?;
+        let mut layers = parse_layers(&buffer)?;
+        
+        // Decode all layers first
+        for layer in &mut layers {
+            layer.decode_all()?;
+        }
+        
+        // Convert to owned by manually constructing
+        let mut owned_layers = Vec::new();
+        for layer in &layers {
+            if let Layer::Tag01(l) = layer {
+                let owned_layer = mlt_nom::v01::OwnedLayer01 {
+                    name: l.name.to_string(),
+                    extent: l.extent,
+                    id: match &l.id {
+                        mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
+                        mlt_nom::v01::Id::None => mlt_nom::v01::OwnedId::None,
+                        _ => mlt_nom::v01::OwnedId::None,
+                    },
+                    geometry: match &l.geometry {
+                        mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
+                        _ => return Err("Geometry not decoded".into()),
+                    },
+                    properties: l.properties.iter().map(|p| {
+                        match p {
+                            mlt_nom::v01::Property::Decoded(d) => mlt_nom::v01::OwnedProperty::Decoded(d.clone()),
+                            _ => panic!("Property not decoded"),
+                        }
+                    }).collect(),
+                };
+                owned_layers.push(OwnedLayer::Tag01(owned_layer));
+            }
+        }
+        
+        let mut app = App::new_single_file(owned_layers, Some(path.to_path_buf()));
+        app.build_tree_items();
+        run_app(app)
+    } else {
+        Err("Path is not a file or directory".into())
+    }
+}
+
+/// Run the TUI application (deprecated - use `run_with_path` instead)
+#[deprecated(note = "Use run_with_path instead")]
+#[allow(dead_code)]
 pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
+    // Convert borrowed layers to owned by parsing again from owned data
+    // This is a workaround since borrowme doesn't provide a direct conversion
+    let owned_layers = Vec::new();
+    if !layers.is_empty() {
+        // We can't easily convert Layer<'a> to OwnedLayer without re-encoding
+        // For now, just return an error
+        return Err("Direct layer conversion not supported. Use run_with_path instead.".into());
+    }
+    
+    let mut app = App::new_single_file(owned_layers, None);
+    app.build_tree_items();
+    run_app(app)
+}
+
+/// Main application loop
+fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -189,27 +463,33 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     
-    let mut app = App::new(layers);
     let mut map_area: Option<Rect> = None;
     
     loop {
         terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(30),
-                    Constraint::Percentage(70),
-                ])
-                .split(f.area());
-            
-            // Render tree panel
-            render_tree_panel(f, chunks[0], &mut app);
-            
-            // Render map panel
-            render_map_panel(f, chunks[1], &app);
-            
-            // Store map area for mouse event handling
-            map_area = Some(chunks[1]);
+            match app.mode {
+                ViewMode::FileBrowser => {
+                    render_file_browser(f, &mut app);
+                }
+                ViewMode::LayerOverview | ViewMode::DetailMode => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Percentage(30),
+                            Constraint::Percentage(70),
+                        ])
+                        .split(f.area());
+                    
+                    // Render tree panel
+                    render_tree_panel(f, chunks[0], &mut app);
+                    
+                    // Render map panel
+                    render_map_panel(f, chunks[1], &app);
+                    
+                    // Store map area for mouse event handling
+                    map_area = Some(chunks[1]);
+                }
+            }
         })?;
         
         // Handle input
@@ -218,7 +498,15 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc => {
+                                if app.handle_escape() {
+                                    break;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                app.handle_enter()?;
+                            }
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
                             _ => {}
@@ -262,20 +550,54 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn render_file_browser(
+    f: &mut ratatui::Frame<'_>,
+    app: &mut App,
+) {
+    let items: Vec<ListItem> = app.mlt_files.iter().enumerate().map(|(idx, path)| {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?");
+        let parent = path.parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        
+        let content = if parent.is_empty() {
+            name.to_string()
+        } else {
+            format!("{parent}/{name}")
+        };
+        
+        let style = if idx == app.selected_file_index {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        
+        ListItem::new(Line::from(Span::styled(content, style)))
+    }).collect();
+    
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(format!("MLT Files ({} found) - ↑/↓ to navigate, Enter to open, q to quit", app.mlt_files.len())));
+    
+    f.render_stateful_widget(list, f.area(), &mut app.file_list_state);
+}
+
 fn render_tree_panel(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
-    app: &mut App<'_>,
+    app: &mut App,
 ) {
     let items: Vec<ListItem> = app.tree_items.iter().enumerate().map(|(idx, item)| {
         let content = match item {
             TreeItem::AllLayers => "All Layers".to_string(),
             TreeItem::Layer { index } => {
                 let layer = &app.layers[*index];
-                if let Some(l) = layer.as_layer01() {
-                    format!("  Layer: {}", l.name)
-                } else {
-                    format!("  Layer {index}")
+                match layer {
+                    OwnedLayer::Tag01(l) => format!("  Layer: {}", l.name),
+                    OwnedLayer::Unknown(_) => format!("  Layer {index}"),
                 }
             }
             TreeItem::Feature { feature_index, .. } => {
@@ -294,10 +616,24 @@ fn render_tree_panel(
         ListItem::new(Line::from(Span::styled(content, style)))
     }).collect();
     
+    let title = match app.mode {
+        ViewMode::LayerOverview => {
+            let filename = app.current_file.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            format!("{filename} - Enter for details, Esc to go back, q to quit")
+        }
+        ViewMode::DetailMode => {
+            "Layers & Features (↑/↓ to navigate, Esc to go back, q to quit)".to_string()
+        }
+        _ => "Layers & Features".to_string(),
+    };
+    
     let list = List::new(items)
         .block(Block::default()
             .borders(Borders::ALL)
-            .title("Layers & Features (↑/↓ to navigate, q to quit)"));
+            .title(title));
     
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
@@ -305,7 +641,7 @@ fn render_tree_panel(
 fn render_map_panel(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
-    app: &App<'_>,
+    app: &App,
 ) {
     let selected_item = app.get_selected_item();
     let extent = app.get_extent();
@@ -329,8 +665,8 @@ fn render_map_panel(
             
             // Draw geometries
             for (layer_idx, layer) in app.layers.iter().enumerate() {
-                if let Some(l) = layer.as_layer01() {
-                    if let Geometry::Decoded(geom) = &l.geometry {
+                if let OwnedLayer::Tag01(l) = layer {
+                    if let OwnedGeometry::Decoded(geom) = &l.geometry {
                         let should_include_layer = match selected_item {
                             TreeItem::AllLayers => true,
                             TreeItem::Layer { index } => *index == layer_idx,
