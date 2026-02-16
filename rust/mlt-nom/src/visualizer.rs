@@ -2,7 +2,7 @@
 
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -30,6 +30,8 @@ struct App<'a> {
     tree_items: Vec<TreeItem>,
     selected_index: usize,
     list_state: ListState,
+    hovered_item: Option<usize>,
+    mouse_pos: Option<(u16, u16)>,
 }
 
 impl<'a> App<'a> {
@@ -61,6 +63,8 @@ impl<'a> App<'a> {
             tree_items,
             selected_index: 0,
             list_state,
+            hovered_item: None,
+            mouse_pos: None,
         }
     }
     
@@ -80,6 +84,44 @@ impl<'a> App<'a> {
     
     fn get_selected_item(&self) -> &TreeItem {
         &self.tree_items[self.selected_index]
+    }
+    
+    fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
+        // Simple hit test: find feature whose bounding box contains the point
+        let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02; // 2% of view size
+        
+        for (idx, item) in self.tree_items.iter().enumerate() {
+            if let TreeItem::Feature { layer_index, feature_index } = item {
+                if let Some(l) = self.layers[*layer_index].as_layer01() {
+                    if let Geometry::Decoded(geom) = &l.geometry {
+                        let verts = geom.vertices.as_deref().unwrap_or(&[]);
+                        
+                        // Check if any vertex is near the cursor
+                        for i in (0..(verts.len() / 2)).map(|i| i * 2) {
+                            let x = f64::from(verts[i]);
+                            let y = f64::from(verts[i + 1]);
+                            let dx = (x - canvas_x).abs();
+                            let dy = (y - canvas_y).abs();
+                            
+                            if dx < threshold && dy < threshold {
+                                // Check if this vertex belongs to our feature
+                                if Self::vertex_belongs_to_feature(geom, *feature_index, i / 2) {
+                                    self.hovered_item = Some(idx);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.hovered_item = None;
+    }
+    
+    fn vertex_belongs_to_feature(_geom: &DecodedGeometry, _feature_idx: usize, _vertex_idx: usize) -> bool {
+        // Simplified: assume all vertices in range belong to feature
+        // In a full implementation, we'd check geometry_offsets, part_offsets, etc.
+        true
     }
     
     /// Get the extent from the first layer, or use a default
@@ -143,11 +185,12 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     
     let mut app = App::new(layers);
+    let mut map_area: Option<Rect> = None;
     
     loop {
         terminal.draw(|f| {
@@ -164,26 +207,56 @@ pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
             
             // Render map panel
             render_map_panel(f, chunks[1], &app);
+            
+            // Store map area for mouse event handling
+            map_area = Some(chunks[1]);
         })?;
         
         // Handle input
         if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                        _ => {}
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                            _ => {}
+                        }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    if let MouseEventKind::Moved = mouse.kind {
+                        app.mouse_pos = Some((mouse.column, mouse.row));
+                        
+                        // Convert screen coordinates to canvas coordinates
+                        if let Some(area) = map_area {
+                            if mouse.column >= area.x && mouse.column < area.x + area.width
+                                && mouse.row >= area.y && mouse.row < area.y + area.height
+                            {
+                                let bounds = app.calculate_bounds();
+                                let rel_x = f64::from(mouse.column - area.x) / f64::from(area.width);
+                                let rel_y = f64::from(mouse.row - area.y) / f64::from(area.height);
+                                
+                                // Map to canvas coordinates (accounting for canvas coordinate system)
+                                let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
+                                let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1); // Flip Y
+                                
+                                app.find_hovered_feature(canvas_x, canvas_y, bounds);
+                            } else {
+                                app.hovered_item = None;
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     
     // Restore terminal
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     
     Ok(())
@@ -212,6 +285,8 @@ fn render_tree_panel(
         
         let style = if idx == app.selected_index {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if Some(idx) == app.hovered_item {
+            Style::default().fg(Color::LightGreen).add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default()
         };
@@ -263,7 +338,7 @@ fn render_map_panel(
                         };
                         
                         if should_include_layer {
-                            draw_geometry(ctx, geom, selected_item, layer_idx);
+                            draw_geometry(ctx, geom, selected_item, layer_idx, app.hovered_item.as_ref(), &app.tree_items);
                         }
                     }
                 }
@@ -273,11 +348,46 @@ fn render_map_panel(
     f.render_widget(canvas, area);
 }
 
+/// Get color for a geometry type
+fn get_geometry_type_color(geom_type: GeometryType) -> Color {
+    match geom_type {
+        GeometryType::Point => Color::Magenta,
+        GeometryType::MultiPoint => Color::LightMagenta,
+        GeometryType::LineString => Color::Cyan,
+        GeometryType::MultiLineString => Color::LightCyan,
+        GeometryType::Polygon => Color::Green,
+        GeometryType::MultiPolygon => Color::LightGreen,
+    }
+}
+
+/// Calculate winding order of a polygon ring
+/// Returns true for counter-clockwise (CCW), false for clockwise (CW)
+fn calculate_winding_order<F>(start: usize, end: usize, v: &F) -> bool
+where
+    F: Fn(usize) -> Option<[f64; 2]>,
+{
+    let mut area = 0.0;
+    for i in start..end.saturating_sub(1) {
+        if let (Some([x1, y1]), Some([x2, y2])) = (v(i), v(i + 1)) {
+            area += (x2 - x1) * (y2 + y1);
+        }
+    }
+    // Close the ring
+    if end > start {
+        if let (Some([x1, y1]), Some([x2, y2])) = (v(end - 1), v(start)) {
+            area += (x2 - x1) * (y2 + y1);
+        }
+    }
+    area < 0.0 // CCW if negative
+}
+
 fn draw_geometry(
     ctx: &mut ratatui::widgets::canvas::Context<'_>,
     geom: &DecodedGeometry,
     selected_item: &TreeItem,
     layer_idx: usize,
+    hovered_item: Option<&usize>,
+    tree_items: &[TreeItem],
 ) {
     let verts = geom.vertices.as_deref().unwrap_or(&[]);
     
@@ -301,10 +411,20 @@ fn draw_geometry(
             continue;
         }
         
+        // Check if this feature is hovered
+        let is_hovered = hovered_item.is_some_and(|&h_idx| {
+            matches!(&tree_items[h_idx], TreeItem::Feature { layer_index, feature_index } 
+                if *layer_index == layer_idx && *feature_index == feat_idx)
+        });
+        
+        // Determine color based on selection state and geometry type
+        let base_color = get_geometry_type_color(*geom_type);
         let color = if matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
-            Color::Yellow
+            Color::Yellow // Selected feature
+        } else if is_hovered {
+            Color::White // Hovered feature
         } else {
-            Color::Cyan
+            base_color // Color by geometry type
         };
         
         // Get the geometry coordinate ranges based on the type
@@ -359,7 +479,20 @@ fn draw_geometry(
                 for ring_idx in ring_start..ring_end {
                     let start = r[ring_idx] as usize;
                     let end = r[ring_idx + 1] as usize;
-                    draw_polygon_ring(ctx, start, end, &v, color);
+                    
+                    // Use winding order to determine color for polygons
+                    let ring_color = if is_hovered || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
+                        color // Keep override colors
+                    } else {
+                        let is_ccw = calculate_winding_order(start, end, &v);
+                        if is_ccw {
+                            Color::Blue // CCW - typically outer ring
+                        } else {
+                            Color::Red // CW - typically hole
+                        }
+                    };
+                    
+                    draw_polygon_ring(ctx, start, end, &v, ring_color);
                 }
             }
             (GeometryType::MultiPoint, Some(g), _, _) => {
@@ -388,7 +521,20 @@ fn draw_geometry(
                     for ring_idx in rs..re {
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
-                        draw_polygon_ring(ctx, ring_start, ring_end, &v, color);
+                        
+                        // Use winding order to determine color for polygons
+                        let ring_color = if is_hovered || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx) {
+                            color // Keep override colors
+                        } else {
+                            let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
+                            if is_ccw {
+                                Color::Blue // CCW - typically outer ring
+                            } else {
+                                Color::Red // CW - typically hole
+                            }
+                        };
+                        
+                        draw_polygon_ring(ctx, ring_start, ring_end, &v, ring_color);
                     }
                 }
             }

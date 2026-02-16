@@ -48,10 +48,21 @@ Features:
   - "All Layers" - shows all features from all layers
   - Individual layers - shows all features in that layer
   - Individual features - shows only the selected feature
+  - Hovered features are highlighted with underlined green text
 - **Map Panel (right)**: Visual representation of the geometries
-  - Shows the extent boundary as a thin rectangle
-  - Geometries are color-coded (cyan for normal, yellow for selected)
+  - Shows the extent boundary as a thin gray rectangle
+  - **Color coding by geometry type**:
+    - Points: Magenta (multi-point: light magenta)
+    - LineStrings: Cyan (multi-linestring: light cyan)
+    - Polygons: Blue/Red based on winding order (multi-polygon: same)
+  - **Polygon winding order visualization**:
+    - Blue: Counter-clockwise rings (typically outer rings)
+    - Red: Clockwise rings (typically holes)
+  - Selected features: Yellow
+  - Hovered features: White
   - Automatically adjusts bounds to fit all visible geometries
+- **Mouse Interaction**:
+  - Hover over geometries to highlight them in the tree view
 - **Keyboard Navigation**:
   - `↑`/`k` - Move selection up
   - `↓`/`j` - Move selection down
