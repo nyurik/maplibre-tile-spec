@@ -1189,24 +1189,45 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     feature_index,
                     part_index,
                 } => {
-                    let sub_type = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            geom.vector_types.get(*feature_index).map(|gt| match gt {
-                                GeometryType::MultiPoint => "Point",
-                                GeometryType::MultiLineString => "LineString",
-                                GeometryType::MultiPolygon => "Polygon",
-                                _ => "Part",
-                            })
+                    let (sub_type, suffix) =
+                        if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
+                            if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                                let gt = geom.vector_types.get(*feature_index);
+                                let name = gt.map(|g| match g {
+                                    GeometryType::MultiPoint => "Point",
+                                    GeometryType::MultiLineString => "LineString",
+                                    GeometryType::MultiPolygon => "Polygon",
+                                    _ => "Part",
+                                });
+                                let sz = if matches!(
+                                    gt,
+                                    Some(
+                                        GeometryType::MultiLineString | GeometryType::MultiPolygon
+                                    )
+                                ) {
+                                    let (s, e) = get_sub_feature_vertex_range(
+                                        geom,
+                                        *feature_index,
+                                        *part_index,
+                                    );
+                                    format!(" ({}v)", e.saturating_sub(s))
+                                } else {
+                                    String::new()
+                                };
+                                (name, sz)
+                            } else {
+                                (None, String::new())
+                            }
                         } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                            (None, String::new())
+                        };
                     let type_str = sub_type.unwrap_or("Part");
                     let color = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
                         if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            geom.vector_types.get(*feature_index).copied().map(get_geometry_type_color)
+                            geom.vector_types
+                                .get(*feature_index)
+                                .copied()
+                                .map(get_geometry_type_color)
                         } else {
                             None
                         }
@@ -1214,7 +1235,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         None
                     };
                     (
-                        format!("      Part {part_index}: {type_str}"),
+                        format!("      Part {part_index}: {type_str}{suffix}"),
                         color,
                     )
                 }
