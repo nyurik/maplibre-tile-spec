@@ -1,89 +1,8 @@
-use std::fmt::{Debug, Display, Formatter};
-
-use hex::ToHex as _;
-use integer_encoding::VarInt;
 use num_traits::{AsPrimitive, PrimInt, WrappingAdd};
 use zigzag::ZigZag;
 
-use crate::{MltError, MltRefResult};
-
-/// Parse a varint (variable-length integer) from the input
-pub fn parse_varint<T: VarInt>(input: &[u8]) -> MltRefResult<'_, T> {
-    match VarInt::decode_var(input) {
-        Some((value, consumed)) => Ok((&input[consumed..], value)),
-        None => Err(MltError::ParsingVarInt),
-    }
-}
-
-pub fn all<T>((input, value): (&[u8], T)) -> Result<T, MltError> {
-    if input.is_empty() {
-        Ok(value)
-    } else {
-        Err(MltError::BufferUnderflow {
-            needed: input.len(),
-            remaining: 0,
-        })
-    }
-}
-pub fn parse_varint_vec<T, U>(mut input: &[u8], size: u32) -> MltRefResult<'_, Vec<U>>
-where
-    T: VarInt,
-    U: TryFrom<T>,
-    MltError: From<<U as TryFrom<T>>::Error>,
-{
-    let mut values = Vec::with_capacity(usize::try_from(size)?);
-    let mut val;
-    for _ in 0..size {
-        (input, val) = parse_varint::<T>(input)?;
-        values.push(val.try_into()?);
-    }
-    Ok((input, values))
-}
-
-/// Parse a length-prefixed UTF-8 string from the input
-pub fn parse_string(input: &[u8]) -> MltRefResult<'_, &str> {
-    let (input, length) = parse_varint::<usize>(input)?;
-    let (input, value) = take(input, length)?;
-    let value = str::from_utf8(value)?;
-    Ok((input, value))
-}
-
-/// Parse a single byte from the input
-pub fn parse_u8(input: &[u8]) -> MltRefResult<'_, u8> {
-    if input.is_empty() {
-        Err(MltError::UnableToTake(1))
-    } else {
-        Ok((&input[1..], input[0]))
-    }
-}
-
-/// Parse a single byte from the input when we know the value is less than 128
-pub fn parse_u7(input: &[u8]) -> MltRefResult<'_, u8> {
-    let (input, value) = parse_u8(input)?;
-    if value < 128 {
-        Ok((input, value))
-    } else {
-        Err(MltError::Parsing7BitInt(value))
-    }
-}
-
-/// Helper function to encode a varint using integer-encoding
-pub fn encode_varint(data: &mut Vec<u8>, value: u64) {
-    data.extend_from_slice(&value.encode_var_vec());
-}
-
-pub fn encode_str(data: &mut Vec<u8>, value: &[u8]) {
-    encode_varint(data, value.len() as u64);
-    data.extend_from_slice(value);
-}
-
-#[inline]
-pub fn take(input: &[u8], size: usize) -> MltRefResult<'_, &[u8]> {
-    let (value, input) = input
-        .split_at_checked(size)
-        .ok_or(MltError::UnableToTake(size))?;
-    Ok((input, value))
-}
+use crate::{MltError, MltRefResult, utils::take};
+use std::fmt::Debug;
 
 /// Decode ([`ZigZag`] + delta) for Vec2s
 // TODO: The encoded process is (delta + ZigZag) for each component
@@ -137,23 +56,8 @@ pub fn decode_rle<T: PrimInt + Debug>(
     }
     Ok(result)
 }
-
-pub trait SetOptionOnce<T> {
-    fn set_once(&mut self, value: T) -> Result<(), MltError>;
-}
-
-impl<T> SetOptionOnce<T> for Option<T> {
-    fn set_once(&mut self, value: T) -> Result<(), MltError> {
-        if self.replace(value).is_some() {
-            Err(MltError::DuplicateValue)
-        } else {
-            Ok(())
-        }
-    }
-}
-
 /// Decode a slice of bytes into a vector of u32 values assuming little-endian encoding
-pub fn bytes_to_u32s(mut input: &[u8], num_values: u32) -> MltRefResult<'_, Vec<u32>> {
+pub fn decode_bytes_to_u32s(mut input: &[u8], num_values: u32) -> MltRefResult<'_, Vec<u32>> {
     let expected_bytes = num_values as usize * 4;
     if input.len() < expected_bytes {
         return Err(MltError::BufferUnderflow {
@@ -201,64 +105,6 @@ pub fn decode_byte_rle(input: &[u8], num_bytes: usize) -> Vec<u8> {
     output
 }
 
-/// Wrapper type for optional slices to provide a custom Debug implementation
-pub struct OptSeq<'a, T>(pub Option<&'a [T]>);
-
-impl<T: Display + Debug> Debug for OptSeq<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write_seq(f, self.0, ToString::to_string)
-    }
-}
-
-pub struct OptSeqOpt<'a, T>(pub Option<&'a [Option<T>]>);
-
-impl<T: Display + Debug> Debug for OptSeqOpt<'_, T> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write_seq(f, self.0, |opt| match opt {
-            Some(val) => val.to_string(),
-            None => "None".to_string(),
-        })
-    }
-}
-
-fn write_seq<T>(
-    f: &mut Formatter,
-    value: Option<&[T]>,
-    to_str: fn(&T) -> String,
-) -> std::fmt::Result {
-    if let Some(v) = value {
-        if f.alternate() {
-            let items = v.iter().map(to_str).collect::<Vec<_>>().join(",");
-            write!(f, "[{items}; {}]", v.len())
-        } else {
-            let items = v.iter().take(8).map(to_str).collect::<Vec<_>>().join(",");
-            write!(f, "[{items}")?;
-            if v.len() > 8 {
-                write!(f, ", ...; {}]", v.len())
-            } else {
-                write!(f, "]")
-            }
-        }
-    } else {
-        write!(f, "None")
-    }
-}
-
-pub(crate) fn fmt_byte_array(data: &[u8], f: &mut Formatter<'_>) -> std::fmt::Result {
-    if f.alternate() {
-        let vals = data.encode_hex_upper::<String>();
-        write!(f, "[0x{vals}; {}]", data.len())
-    } else {
-        let vals = (&data[..8.min(data.len())]).encode_hex_upper::<String>();
-        write!(
-            f,
-            "[0x{vals}{}; {}]",
-            if data.len() <= 8 { "" } else { "..." },
-            data.len()
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,7 +115,7 @@ mod tests {
         // [0x04, 0x03, 0x02, 0x01] -> 0x01020304
         // [0xDD, 0xCC, 0xBB, 0xAA] -> 0xAABBCCDD
         let bytes: [u8; 8] = [0x04, 0x03, 0x02, 0x01, 0xDD, 0xCC, 0xBB, 0xAA];
-        let res = bytes_to_u32s(&bytes, 2);
+        let res = decode_bytes_to_u32s(&bytes, 2);
         assert!(res.is_ok(), "Should decode valid buffer with 2 values");
         let (remaining, u32s) = res.unwrap();
         assert!(remaining.is_empty(), "All input should be consumed");
@@ -283,7 +129,7 @@ mod tests {
     #[test]
     fn test_bytes_to_u32s_empty() {
         let bytes: [u8; 0] = [];
-        let res = bytes_to_u32s(&bytes, 0);
+        let res = decode_bytes_to_u32s(&bytes, 0);
         assert!(res.is_ok(), "Empty slice with 0 values is valid");
         let (remaining, u32s) = res.unwrap();
         assert!(remaining.is_empty(), "All input should be consumed");
@@ -297,7 +143,7 @@ mod tests {
     fn test_bytes_to_u32s_buffer_underflow() {
         // Only 4 bytes but requesting 2 values (8 bytes needed)
         let bytes = [0x01, 0x02, 0x03, 0x04];
-        let res = bytes_to_u32s(&bytes, 2);
+        let res = decode_bytes_to_u32s(&bytes, 2);
         assert!(
             res.is_err(),
             "Should error if not enough bytes for requested values"
@@ -310,7 +156,7 @@ mod tests {
         let bytes: [u8; 12] = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
         ];
-        let res = bytes_to_u32s(&bytes, 2);
+        let res = decode_bytes_to_u32s(&bytes, 2);
         assert!(res.is_ok(), "Should decode 2 values from larger buffer");
         let (remaining, u32s) = res.unwrap();
         assert_eq!(remaining.len(), 4, "Should have 4 bytes remaining");
