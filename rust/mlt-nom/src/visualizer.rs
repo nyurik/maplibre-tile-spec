@@ -1,9 +1,8 @@
 //! TUI visualizer for MLT files using ratatui
 
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::{fs, io};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -13,6 +12,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use mlt_nom::layer::Layer;
+use mlt_nom::v01::{DecodedGeometry, GeometryType, OwnedGeometry};
+use mlt_nom::{OwnedLayer, parse_layers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -20,10 +22,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::Canvas;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
-
-use mlt_nom::layer::Layer;
-use mlt_nom::v01::{DecodedGeometry, GeometryType, OwnedGeometry};
-use mlt_nom::{OwnedLayer, parse_layers};
 
 /// Visualization mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -654,6 +652,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     let mut map_area: Option<Rect> = None;
     let mut tree_area: Option<Rect> = None;
     let mut last_tree_click: Option<(Instant, usize)> = None; // (time, row)
+    let mut last_file_click: Option<(Instant, usize)> = None; // (time, row)
 
     loop {
         terminal.draw(|f| {
@@ -719,34 +718,90 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                     match mouse.kind {
                         MouseEventKind::Moved => {
                             app.mouse_pos = Some((mouse.column, mouse.row));
+                            app.hovered_item = None;
 
-                            // Convert screen coordinates to canvas coordinates
-                            if let Some(area) = map_area {
-                                if mouse.column >= area.x
-                                    && mouse.column < area.x + area.width
-                                    && mouse.row >= area.y
-                                    && mouse.row < area.y + area.height
-                                {
-                                    let bounds = app.calculate_bounds();
-                                    let rel_x =
-                                        f64::from(mouse.column - area.x) / f64::from(area.width);
-                                    let rel_y =
-                                        f64::from(mouse.row - area.y) / f64::from(area.height);
+                            // Disable hover when a single feature is selected
+                            let single_feature = matches!(
+                                app.tree_items.get(app.selected_index),
+                                Some(TreeItem::Feature { .. })
+                            );
 
-                                    // Map to canvas coordinates (accounting for canvas coordinate system)
-                                    let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
-                                    let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1); // Flip Y
+                            if app.mode == ViewMode::LayerOverview && !single_feature {
+                                // Check if mouse is over the tree panel
+                                if let Some(area) = tree_area {
+                                    let content_y = area.y + 1;
+                                    let content_bottom = area.y + area.height.saturating_sub(1);
+                                    if mouse.column >= area.x
+                                        && mouse.column < area.x + area.width
+                                        && mouse.row >= content_y
+                                        && mouse.row < content_bottom
+                                    {
+                                        let scroll_offset = app.list_state.offset();
+                                        let row = (mouse.row - content_y) as usize + scroll_offset;
+                                        if row < app.tree_items.len()
+                                            && matches!(
+                                                app.tree_items[row],
+                                                TreeItem::Feature { .. }
+                                            )
+                                        {
+                                            app.hovered_item = Some(row);
+                                        }
+                                    }
+                                }
 
-                                    app.find_hovered_feature(canvas_x, canvas_y, bounds);
-                                } else {
-                                    app.hovered_item = None;
+                                // Check if mouse is over the map panel
+                                if app.hovered_item.is_none() {
+                                    if let Some(area) = map_area {
+                                        if mouse.column >= area.x
+                                            && mouse.column < area.x + area.width
+                                            && mouse.row >= area.y
+                                            && mouse.row < area.y + area.height
+                                        {
+                                            let bounds = app.calculate_bounds();
+                                            let rel_x = f64::from(mouse.column - area.x)
+                                                / f64::from(area.width);
+                                            let rel_y = f64::from(mouse.row - area.y)
+                                                / f64::from(area.height);
+
+                                            let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
+                                            let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1);
+
+                                            app.find_hovered_feature(canvas_x, canvas_y, bounds);
+                                        }
+                                    }
                                 }
                             }
                         }
                         MouseEventKind::ScrollUp => app.move_up(),
                         MouseEventKind::ScrollDown => app.move_down(),
                         MouseEventKind::Down(_button) => {
-                            if app.mode == ViewMode::LayerOverview {
+                            if app.mode == ViewMode::FileBrowser {
+                                let area = terminal.get_frame().area();
+                                let content_y = area.y + 1;
+                                let content_bottom = area.y + area.height.saturating_sub(1);
+                                if mouse.column >= area.x
+                                    && mouse.column < area.x + area.width
+                                    && mouse.row >= content_y
+                                    && mouse.row < content_bottom
+                                {
+                                    let scroll_offset = app.file_list_state.offset();
+                                    let clicked_row =
+                                        (mouse.row - content_y) as usize + scroll_offset;
+                                    if clicked_row < app.mlt_files.len() {
+                                        let is_double = last_file_click.is_some_and(|(t, row)| {
+                                            row == clicked_row && t.elapsed().as_millis() < 400
+                                        });
+                                        last_file_click = Some((Instant::now(), clicked_row));
+
+                                        app.selected_file_index = clicked_row;
+                                        app.file_list_state.select(Some(clicked_row));
+
+                                        if is_double {
+                                            app.handle_enter()?;
+                                        }
+                                    }
+                                }
+                            } else if app.mode == ViewMode::LayerOverview {
                                 if let Some(area) = tree_area {
                                     // Check click is inside the tree panel content area (inside borders)
                                     let content_y = area.y + 1; // top border
@@ -756,18 +811,16 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         && mouse.row >= content_y
                                         && mouse.row < content_bottom
                                     {
-                                        let scroll_offset =
-                                            app.list_state.offset();
+                                        let scroll_offset = app.list_state.offset();
                                         let clicked_row =
                                             (mouse.row - content_y) as usize + scroll_offset;
                                         if clicked_row < app.tree_items.len() {
                                             // Detect double-click on same row
-                                            let is_double = last_tree_click.is_some_and(
-                                                |(t, row)| {
+                                            let is_double =
+                                                last_tree_click.is_some_and(|(t, row)| {
                                                     row == clicked_row
                                                         && t.elapsed().as_millis() < 400
-                                                },
-                                            );
+                                                });
                                             last_tree_click = Some((Instant::now(), clicked_row));
 
                                             app.selected_index = clicked_row;
@@ -873,8 +926,8 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                                 OwnedGeometry::Decoded(g) => {
                                     let count = g.vector_types.len();
                                     let first = g.vector_types.first();
-                                    let all_same =
-                                        first.is_some_and(|f| g.vector_types.iter().all(|t| t == f));
+                                    let all_same = first
+                                        .is_some_and(|f| g.vector_types.iter().all(|t| t == f));
                                     let label = if all_same {
                                         format!("{:?}s", first.unwrap())
                                     } else {
@@ -884,10 +937,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                                 }
                                 _ => (0, "features".to_string()),
                             };
-                            (
-                                format!("  Layer: {} ({count} {label})", l.name),
-                                None,
-                            )
+                            (format!("  Layer: {} ({count} {label})", l.name), None)
                         }
                         OwnedLayer::Unknown(_) => (format!("  Layer {index}"), None),
                     }
@@ -914,10 +964,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
                     let color = geom_type.map(get_geometry_type_color);
 
-                    (
-                        format!("    Feat {feature_index}: {type_str}"),
-                        color,
-                    )
+                    (format!("    Feat {feature_index}: {type_str}"), color)
                 }
             };
 
@@ -1136,16 +1183,9 @@ fn draw_geometry(
                 if *layer_index == layer_idx && *feature_index == feat_idx)
         });
 
-        // Determine color based on selection state and geometry type
+        // Determine color based on hover state and geometry type
         let base_color = get_geometry_type_color(*geom_type);
-        let color = if matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
-        {
-            Color::Yellow // Selected feature
-        } else if is_hovered {
-            Color::White // Hovered feature
-        } else {
-            base_color // Color by geometry type
-        };
+        let color = if is_hovered { Color::White } else { base_color };
 
         // Get the geometry coordinate ranges based on the type
         match (
@@ -1205,11 +1245,8 @@ fn draw_geometry(
                     let start = r[ring_idx] as usize;
                     let end = r[ring_idx + 1] as usize;
 
-                    // Use winding order to determine color for polygons
-                    let ring_color = if is_hovered
-                        || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
-                    {
-                        color // Keep override colors
+                    let ring_color = if is_hovered {
+                        color
                     } else {
                         let is_ccw = calculate_winding_order(start, end, &v);
                         if is_ccw {
@@ -1249,11 +1286,8 @@ fn draw_geometry(
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
 
-                        // Use winding order to determine color for polygons
-                        let ring_color = if is_hovered
-                            || matches!(selected_item, TreeItem::Feature { feature_index, .. } if *feature_index == feat_idx)
-                        {
-                            color // Keep override colors
+                        let ring_color = if is_hovered {
+                            color
                         } else {
                             let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
                             if is_ccw {
