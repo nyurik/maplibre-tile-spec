@@ -5,7 +5,7 @@ use std::fs;
 use mlt_nom::parse_layers;
 
 #[test]
-#[cfg(feature = "tui")]
+#[cfg(feature = "cli")]
 fn test_visualizer_can_parse_simple_files() {
     // Test that we can successfully decode files that the visualizer will work with
     let test_files = [

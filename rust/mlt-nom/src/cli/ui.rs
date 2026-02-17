@@ -1,9 +1,12 @@
 //! TUI visualizer for MLT files using ratatui
 
 use std::collections::HashSet;
+use std::fs::canonicalize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{fs, io};
+
+use anyhow::bail;
 use clap::Args;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -14,15 +17,18 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use mlt_nom::layer::Layer;
-use mlt_nom::v01::{DecodedGeometry, GeometryType, OwnedGeometry};
+use mlt_nom::v01::{
+    DecodedGeometry, Geometry, GeometryType, Id, Layer01, OwnedGeometry, OwnedId, OwnedLayer01,
+    OwnedProperty, Property,
+};
 use mlt_nom::{OwnedLayer, parse_layers};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::Canvas;
+use ratatui::widgets::canvas::{Canvas, Context};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::{Frame, Terminal};
 
 /// Visualization mode
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,10 +46,20 @@ pub struct UiArgs {
 }
 
 pub fn ui(args: &UiArgs) -> anyhow::Result<()> {
-    run_with_path(&args.path)?;
-    Ok(())
+    let app = if args.path.is_dir() {
+        let mlt_files = find_mlt_files(&args.path)?;
+        if mlt_files.is_empty() {
+            let path = canonicalize(&args.path)?;
+            bail!("No .mlt files found in {}", path.display());
+        }
+        App::new_file_browser(mlt_files)
+    } else if args.path.is_file() {
+        App::new_single_file(load_and_decode(&args.path)?, Some(args.path.to_path_buf()))
+    } else {
+        bail!("Path is not a file or directory");
+    };
+    run_app(app)
 }
-
 
 /// Represents a selectable item in the tree view
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +95,6 @@ struct App {
     selected_index: usize,
     list_state: ListState,
     hovered_item: Option<usize>,
-    mouse_pos: Option<(u16, u16)>,
     // Expansion state for layers (layer_index -> is_expanded)
     expanded_layers: Vec<bool>,
     // Expansion state for multi-geometry features (layer_index, feature_index)
@@ -94,23 +109,19 @@ struct App {
     cached_bounds_key: usize,
 }
 
-impl App {
-    fn new_file_browser(mlt_files: Vec<PathBuf>) -> Self {
-        let mut file_list_state = ListState::default();
-        file_list_state.select(Some(0));
-
+impl Default for App {
+    fn default() -> Self {
         Self {
             mode: ViewMode::FileBrowser,
-            mlt_files,
+            mlt_files: Vec::new(),
             selected_file_index: 0,
-            file_list_state,
+            file_list_state: ListState::default(),
             current_file: None,
             layers: Vec::new(),
             tree_items: Vec::new(),
             selected_index: 0,
             list_state: ListState::default(),
             hovered_item: None,
-            mouse_pos: None,
             expanded_layers: Vec::new(),
             expanded_features: HashSet::new(),
             last_scroll_time: Instant::now(),
@@ -120,108 +131,84 @@ impl App {
             cached_bounds_key: usize::MAX,
         }
     }
+}
 
-    fn new_single_file(layers: Vec<OwnedLayer>, file_path: Option<PathBuf>) -> Self {
-        let tree_items = vec![TreeItem::AllLayers];
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
-
-        // Auto-expand if only one layer
-        let expanded_layers = if layers.len() == 1 {
-            vec![true]
-        } else {
-            vec![false; layers.len()]
-        };
-
+impl App {
+    fn new_file_browser(mlt_files: Vec<PathBuf>) -> Self {
+        let mut file_list_state = ListState::default();
+        file_list_state.select(Some(0));
         Self {
-            mode: ViewMode::LayerOverview,
-            mlt_files: Vec::new(),
-            selected_file_index: 0,
-            file_list_state: ListState::default(),
-            current_file: file_path,
-            layers,
-            tree_items,
-            selected_index: 0,
-            list_state,
-            hovered_item: None,
-            mouse_pos: None,
-            expanded_layers,
-            expanded_features: HashSet::new(),
-            last_scroll_time: Instant::now(),
-            scroll_speed: 1,
-            needs_redraw: true,
-            cached_bounds: None,
-            cached_bounds_key: usize::MAX,
+            mlt_files,
+            file_list_state,
+            ..Self::default()
         }
     }
 
+    fn new_single_file(layers: Vec<OwnedLayer>, file_path: Option<PathBuf>) -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let expanded_layers = auto_expand(&layers);
+        let mut app = Self {
+            mode: ViewMode::LayerOverview,
+            current_file: file_path,
+            list_state,
+            expanded_layers,
+            layers,
+            ..Self::default()
+        };
+        app.build_tree_items();
+        app
+    }
+
     fn load_file(&mut self, path: &Path) -> anyhow::Result<()> {
-        let buffer = fs::read(path)?;
-        let mut layers = parse_layers(&buffer)?;
-
-        // Decode all layers first
-        for layer in &mut layers {
-            layer.decode_all()?;
-        }
-
-        // Convert to owned layers
-        self.layers = convert_to_owned_layers(&layers)?;
+        self.layers = load_and_decode(path)?;
         self.current_file = Some(path.to_path_buf());
         self.mode = ViewMode::LayerOverview;
-
-        // Auto-expand if only one layer
-        self.expanded_layers = if self.layers.len() == 1 {
-            vec![true]
-        } else {
-            vec![false; self.layers.len()]
-        };
+        self.expanded_layers = auto_expand(&self.layers);
         self.expanded_features.clear();
-
         self.build_tree_items();
         self.selected_index = 0;
         self.list_state.select(Some(0));
         self.invalidate_bounds();
-
         Ok(())
     }
 
     fn build_tree_items(&mut self) {
         self.tree_items.clear();
-
-        // Always show all layers (not just root)
         self.tree_items.push(TreeItem::AllLayers);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            match layer {
-                OwnedLayer::Tag01(l) => {
-                    self.tree_items.push(TreeItem::Layer { index: layer_idx });
+            self.tree_items.push(TreeItem::Layer { index: layer_idx });
 
-                    // Add features if layer is expanded
-                    if layer_idx < self.expanded_layers.len() && self.expanded_layers[layer_idx] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            for feature_idx in 0..geom.vector_types.len() {
-                                self.tree_items.push(TreeItem::Feature {
-                                    layer_index: layer_idx,
-                                    feature_index: feature_idx,
-                                });
+            let OwnedLayer::Tag01(l) = layer else {
+                continue;
+            };
+            if !self
+                .expanded_layers
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let OwnedGeometry::Decoded(geom) = &l.geometry else {
+                continue;
+            };
 
-                                // Add sub-features for expanded multi-geometry features
-                                if self.expanded_features.contains(&(layer_idx, feature_idx)) {
-                                    let n_parts = get_multi_part_count(geom, feature_idx);
-                                    for part_idx in 0..n_parts {
-                                        self.tree_items.push(TreeItem::SubFeature {
-                                            layer_index: layer_idx,
-                                            feature_index: feature_idx,
-                                            part_index: part_idx,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+            for feature_idx in 0..geom.vector_types.len() {
+                self.tree_items.push(TreeItem::Feature {
+                    layer_index: layer_idx,
+                    feature_index: feature_idx,
+                });
+
+                if self.expanded_features.contains(&(layer_idx, feature_idx)) {
+                    for part_idx in 0..get_multi_part_count(geom, feature_idx) {
+                        self.tree_items.push(TreeItem::SubFeature {
+                            layer_index: layer_idx,
+                            feature_index: feature_idx,
+                            part_index: part_idx,
+                        });
                     }
-                }
-                OwnedLayer::Unknown(_) => {
-                    self.tree_items.push(TreeItem::Layer { index: layer_idx });
                 }
             }
         }
@@ -229,15 +216,13 @@ impl App {
 
     fn scroll_step(&mut self) -> usize {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_scroll_time);
+        let elapsed_ms = now.duration_since(self.last_scroll_time).as_millis();
         self.last_scroll_time = now;
-        if elapsed.as_millis() < 50 {
-            self.scroll_speed = (self.scroll_speed + 1).min(20);
-        } else if elapsed.as_millis() < 120 {
-            self.scroll_speed = self.scroll_speed.max(2);
-        } else {
-            self.scroll_speed = 1;
-        }
+        self.scroll_speed = match elapsed_ms {
+            0..50 => (self.scroll_speed + 1).min(20),
+            50..120 => self.scroll_speed.max(2),
+            _ => 1,
+        };
         self.scroll_speed
     }
 
@@ -302,8 +287,9 @@ impl App {
             }
             ViewMode::LayerOverview => match self.tree_items.get(self.selected_index) {
                 Some(TreeItem::Layer { index }) => {
-                    if *index < self.expanded_layers.len() {
-                        self.expanded_layers[*index] = !self.expanded_layers[*index];
+                    let index = *index;
+                    if index < self.expanded_layers.len() {
+                        self.expanded_layers[index] = !self.expanded_layers[index];
                         self.build_tree_items();
                         self.invalidate();
                     }
@@ -313,12 +299,8 @@ impl App {
                     feature_index,
                 }) => {
                     let key = (*layer_index, *feature_index);
-                    if self.is_multi_geometry(*layer_index, *feature_index) {
-                        if self.expanded_features.contains(&key) {
-                            self.expanded_features.remove(&key);
-                        } else {
-                            self.expanded_features.insert(key);
-                        }
+                    if self.is_multi_geometry(key.0, key.1) {
+                        self.toggle_feature(key);
                         self.build_tree_items();
                         self.invalidate();
                     }
@@ -342,6 +324,12 @@ impl App {
     fn is_multi_geometry(&self, layer_index: usize, feature_index: usize) -> bool {
         self.get_decoded_geometry(layer_index)
             .is_some_and(|geom| get_multi_part_count(geom, feature_index) > 0)
+    }
+
+    fn toggle_feature(&mut self, key: (usize, usize)) {
+        if !self.expanded_features.remove(&key) {
+            self.expanded_features.insert(key);
+        }
     }
 
     /// Rebuild tree items after expansion state changes, clamping selection.
@@ -469,7 +457,7 @@ impl App {
 
     fn invalidate_bounds(&mut self) {
         self.cached_bounds = None;
-        self.needs_redraw = true;
+        self.invalidate();
     }
 
     fn get_selected_item(&self) -> &TreeItem {
@@ -499,7 +487,7 @@ impl App {
                 ..
             } => self.tree_items.iter().position(|t| {
                 matches!(t, TreeItem::Feature { layer_index: li, feature_index: fi }
-                    if *li == layer_index && *fi == feature_index)
+                        if *li == layer_index && *fi == feature_index)
             }),
             TreeItem::Feature { layer_index, .. } => self
                 .tree_items
@@ -525,7 +513,7 @@ impl App {
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
         let selected_item = self.get_selected_item().clone();
         let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02;
-        let early_exit = threshold * threshold * 0.01; // close enough to stop searching
+        let early_exit = threshold * threshold * 0.01;
         let mut best: Option<(usize, f64)> = None;
 
         'outer: for (idx, item) in self.tree_items.iter().enumerate() {
@@ -655,9 +643,7 @@ impl App {
             };
             let verts = geom.vertices.as_deref().unwrap_or(&[]);
             match selected_item {
-                TreeItem::AllLayers => {
-                    update(verts, 0, verts.len() / 2);
-                }
+                TreeItem::AllLayers => update(verts, 0, verts.len() / 2),
                 TreeItem::Layer { index } if *index == layer_idx => {
                     update(verts, 0, verts.len() / 2);
                 }
@@ -677,7 +663,6 @@ impl App {
             }
         }
 
-        // Ensure bounds include the extent
         min_x = min_x.min(0.0);
         min_y = min_y.min(0.0);
         max_x = max_x.max(extent);
@@ -685,7 +670,6 @@ impl App {
 
         let padding_x = (max_x - min_x) * 0.1;
         let padding_y = (max_y - min_y) * 0.1;
-
         (
             min_x - padding_x,
             min_y - padding_y,
@@ -695,10 +679,27 @@ impl App {
     }
 }
 
-/// Convert borrowed layers to owned layers
-fn convert_to_owned_layers(
-    layers: &[Layer<'_>],
-) -> anyhow::Result<Vec<OwnedLayer>> {
+/// Auto-expand layers: expand automatically when there's only a single layer.
+fn auto_expand(layers: &[OwnedLayer]) -> Vec<bool> {
+    if layers.len() == 1 {
+        vec![true]
+    } else {
+        vec![false; layers.len()]
+    }
+}
+
+/// Load an MLT file, decode all layers, and convert to owned.
+fn load_and_decode(path: &Path) -> anyhow::Result<Vec<OwnedLayer>> {
+    let buffer = fs::read(path)?;
+    let mut layers = parse_layers(&buffer)?;
+    for layer in &mut layers {
+        layer.decode_all()?;
+    }
+    convert_to_owned_layers(&layers)
+}
+
+/// Convert borrowed layers to owned layers.
+fn convert_to_owned_layers(layers: &[Layer<'_>]) -> anyhow::Result<Vec<OwnedLayer>> {
     layers
         .iter()
         .filter_map(|layer| match layer {
@@ -708,35 +709,31 @@ fn convert_to_owned_layers(
         .collect()
 }
 
-fn convert_layer01(
-    l: &mlt_nom::v01::Layer01<'_>,
-) -> anyhow::Result<OwnedLayer> {
+fn convert_layer01(l: &Layer01<'_>) -> anyhow::Result<OwnedLayer> {
     let properties = l
         .properties
         .iter()
         .map(|p| match p {
-            mlt_nom::v01::Property::Decoded(d) => {
-                Ok(mlt_nom::v01::OwnedProperty::Decoded(d.clone()))
-            }
-            mlt_nom::v01::Property::Raw(_) => Err(anyhow::anyhow!("Property not decoded")),
+            Property::Decoded(d) => Ok(OwnedProperty::Decoded(d.clone())),
+            Property::Raw(_) => bail!("Property not decoded"),
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(OwnedLayer::Tag01(mlt_nom::v01::OwnedLayer01 {
+    Ok(OwnedLayer::Tag01(OwnedLayer01 {
         name: l.name.to_string(),
         extent: l.extent,
         id: match &l.id {
-            mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
-            mlt_nom::v01::Id::None | mlt_nom::v01::Id::Raw(_) => mlt_nom::v01::OwnedId::None,
+            Id::Decoded(d) => OwnedId::Decoded(d.clone()),
+            Id::None | Id::Raw(_) => OwnedId::None,
         },
         geometry: match &l.geometry {
-            mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
-            mlt_nom::v01::Geometry::Raw(_) => return Err(anyhow::anyhow!("Geometry not decoded")),
+            Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
+            Geometry::Raw(_) => bail!("Geometry not decoded"),
         },
         properties,
     }))
 }
 
-/// Recursively find all .mlt files in a directory
+/// Recursively find all .mlt files in a directory.
 fn find_mlt_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
         if dir.is_dir() {
@@ -759,40 +756,20 @@ fn find_mlt_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(mlt_files)
 }
 
-/// Run the TUI application with a path (file or directory)
-pub fn run_with_path(path: &Path) -> anyhow::Result<()> {
-    if path.is_dir() {
-        // Directory mode - browse files
-        let mlt_files = find_mlt_files(path)?;
-        if mlt_files.is_empty() {
-            anyhow::bail!("No .mlt files found in directory");
-        }
-        let app = App::new_file_browser(mlt_files);
-        run_app(app)
-    } else if path.is_file() {
-        // Single file mode
-        let buffer = fs::read(path)?;
-        let mut layers = parse_layers(&buffer)?;
+/// If a mouse position falls within a list content area, return the row index.
+fn click_row_in_area(col: u16, row: u16, area: Rect, scroll_offset: usize) -> Option<usize> {
+    let content_y = area.y + 1;
+    let content_bottom = area.y + area.height.saturating_sub(1);
+    (col >= area.x && col < area.x + area.width && row >= content_y && row < content_bottom)
+        .then(|| (row - content_y) as usize + scroll_offset)
+}
 
-        // Decode all layers first
-        for layer in &mut layers {
-            layer.decode_all()?;
-        }
-
-        // Convert to owned by using the helper function
-        let owned_layers = convert_to_owned_layers(&layers)?;
-
-        let mut app = App::new_single_file(owned_layers, Some(path.to_path_buf()));
-        app.build_tree_items();
-        run_app(app)
-    } else {
-        Err(anyhow::anyhow!("Path is not a file or directory"))
-    }
+fn block_with_title(title: impl Into<Line<'static>>) -> Block<'static> {
+    Block::default().borders(Borders::ALL).title(title)
 }
 
 /// Main application loop
 fn run_app(mut app: App) -> anyhow::Result<()> {
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -801,25 +778,21 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
 
     let mut map_area: Option<Rect> = None;
     let mut tree_area: Option<Rect> = None;
-    let mut last_tree_click: Option<(Instant, usize)> = None; // (time, row)
-    let mut last_file_click: Option<(Instant, usize)> = None; // (time, row)
+    let mut last_tree_click: Option<(Instant, usize)> = None;
+    let mut last_file_click: Option<(Instant, usize)> = None;
 
     loop {
         if app.needs_redraw {
             app.needs_redraw = false;
             terminal.draw(|f| match app.mode {
-                ViewMode::FileBrowser => {
-                    render_file_browser(f, &mut app);
-                }
+                ViewMode::FileBrowser => render_file_browser(f, &mut app),
                 ViewMode::LayerOverview => {
                     let chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
                         .split(f.area());
-
                     render_tree_panel(f, chunks[0], &mut app);
                     render_map_panel(f, chunks[1], &app);
-
                     tree_area = Some(chunks[0]);
                     map_area = Some(chunks[1]);
                 }
@@ -828,62 +801,52 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
 
         if event::poll(std::time::Duration::from_millis(16))? {
             match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('c')
-                        {
-                            break;
-                        }
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc => {
-                                if app.handle_escape() {
-                                    break;
-                                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        break;
+                    }
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if app.handle_escape() {
+                                break;
                             }
-                            KeyCode::Enter => {
-                                app.handle_enter()?;
-                            }
-                            KeyCode::Char('+' | '=') | KeyCode::Right => app.handle_plus(),
-                            KeyCode::Char('-') => app.handle_minus(),
-                            KeyCode::Char('*') => app.handle_star(),
-                            KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                            KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                            KeyCode::Left => app.handle_left_arrow(),
-                            KeyCode::PageUp => app.move_up_by(10),
-                            KeyCode::PageDown => app.move_down_by(10),
-                            KeyCode::Home => app.move_up_by(usize::MAX),
-                            KeyCode::End => app.move_down_by(usize::MAX),
-                            _ => {}
                         }
+                        KeyCode::Enter => app.handle_enter()?,
+                        KeyCode::Char('+' | '=') | KeyCode::Right => app.handle_plus(),
+                        KeyCode::Char('-') => app.handle_minus(),
+                        KeyCode::Char('*') => app.handle_star(),
+                        KeyCode::Up | KeyCode::Char('k') => app.move_up(),
+                        KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                        KeyCode::Left => app.handle_left_arrow(),
+                        KeyCode::PageUp => app.move_up_by(10),
+                        KeyCode::PageDown => app.move_down_by(10),
+                        KeyCode::Home => app.move_up_by(usize::MAX),
+                        KeyCode::End => app.move_down_by(usize::MAX),
+                        _ => {}
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Moved => {
-                        app.mouse_pos = Some((mouse.column, mouse.row));
                         let prev_hovered = app.hovered_item;
                         app.hovered_item = None;
 
                         let hover_disabled = matches!(
                             app.tree_items.get(app.selected_index),
-                            Some(TreeItem::Feature {
-                                layer_index,
-                                feature_index,
-                            }) if !app.expanded_features.contains(&(*layer_index, *feature_index))
+                            Some(TreeItem::Feature { layer_index, feature_index })
+                                if !app.expanded_features.contains(&(*layer_index, *feature_index))
                         );
 
                         if app.mode == ViewMode::LayerOverview && !hover_disabled {
                             if let Some(area) = tree_area {
-                                let content_y = area.y + 1;
-                                let content_bottom = area.y + area.height.saturating_sub(1);
-                                if mouse.column >= area.x
-                                    && mouse.column < area.x + area.width
-                                    && mouse.row >= content_y
-                                    && mouse.row < content_bottom
-                                {
-                                    let scroll_offset = app.list_state.offset();
-                                    let row = (mouse.row - content_y) as usize + scroll_offset;
+                                if let Some(row) = click_row_in_area(
+                                    mouse.column,
+                                    mouse.row,
+                                    area,
+                                    app.list_state.offset(),
+                                ) {
                                     if row < app.tree_items.len()
                                         && matches!(
                                             app.tree_items[row],
@@ -907,10 +870,8 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
                                             / f64::from(area.width);
                                         let rel_y =
                                             f64::from(mouse.row - area.y) / f64::from(area.height);
-
                                         let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
                                         let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1);
-
                                         app.find_hovered_feature(canvas_x, canvas_y, bounds);
                                     }
                                 }
@@ -929,28 +890,23 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
                         let step = app.scroll_step();
                         app.move_down_by(step);
                     }
-                    MouseEventKind::Down(_button) => {
+                    MouseEventKind::Down(_) => {
                         if app.mode == ViewMode::FileBrowser {
                             let area = terminal.get_frame().area();
-                            let content_y = area.y + 1;
-                            let content_bottom = area.y + area.height.saturating_sub(1);
-                            if mouse.column >= area.x
-                                && mouse.column < area.x + area.width
-                                && mouse.row >= content_y
-                                && mouse.row < content_bottom
-                            {
-                                let scroll_offset = app.file_list_state.offset();
-                                let clicked_row = (mouse.row - content_y) as usize + scroll_offset;
+                            if let Some(clicked_row) = click_row_in_area(
+                                mouse.column,
+                                mouse.row,
+                                area,
+                                app.file_list_state.offset(),
+                            ) {
                                 if clicked_row < app.mlt_files.len() {
                                     let is_double = last_file_click.is_some_and(|(t, row)| {
                                         row == clicked_row && t.elapsed().as_millis() < 400
                                     });
                                     last_file_click = Some((Instant::now(), clicked_row));
-
                                     app.selected_file_index = clicked_row;
                                     app.file_list_state.select(Some(clicked_row));
                                     app.invalidate_bounds();
-
                                     if is_double {
                                         app.handle_enter()?;
                                     }
@@ -958,26 +914,20 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
                             }
                         } else if app.mode == ViewMode::LayerOverview {
                             if let Some(area) = tree_area {
-                                let content_y = area.y + 1;
-                                let content_bottom = area.y + area.height.saturating_sub(1);
-                                if mouse.column >= area.x
-                                    && mouse.column < area.x + area.width
-                                    && mouse.row >= content_y
-                                    && mouse.row < content_bottom
-                                {
-                                    let scroll_offset = app.list_state.offset();
-                                    let clicked_row =
-                                        (mouse.row - content_y) as usize + scroll_offset;
+                                if let Some(clicked_row) = click_row_in_area(
+                                    mouse.column,
+                                    mouse.row,
+                                    area,
+                                    app.list_state.offset(),
+                                ) {
                                     if clicked_row < app.tree_items.len() {
                                         let is_double = last_tree_click.is_some_and(|(t, row)| {
                                             row == clicked_row && t.elapsed().as_millis() < 400
                                         });
                                         last_tree_click = Some((Instant::now(), clicked_row));
-
                                         app.selected_index = clicked_row;
                                         app.list_state.select(Some(clicked_row));
                                         app.invalidate_bounds();
-
                                         if is_double {
                                             app.handle_enter()?;
                                         }
@@ -1007,7 +957,6 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -1015,11 +964,10 @@ fn run_app(mut app: App) -> anyhow::Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-
     Ok(())
 }
 
-fn render_file_browser(f: &mut ratatui::Frame<'_>, app: &mut App) {
+fn render_file_browser(f: &mut Frame<'_>, app: &mut App) {
     let items: Vec<ListItem> = app
         .mlt_files
         .iter()
@@ -1027,13 +975,11 @@ fn render_file_browser(f: &mut ratatui::Frame<'_>, app: &mut App) {
         .map(|(idx, path)| {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
             let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
-
             let content = if parent.is_empty() {
                 name.to_string()
             } else {
                 format!("{parent}/{name}")
             };
-
             let style = if idx == app.selected_file_index {
                 Style::default()
                     .fg(Color::Yellow)
@@ -1041,20 +987,19 @@ fn render_file_browser(f: &mut ratatui::Frame<'_>, app: &mut App) {
             } else {
                 Style::default()
             };
-
             ListItem::new(Line::from(Span::styled(content, style)))
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+    let title = format!(
         "MLT Files ({} found) - ↑/↓ to navigate, Enter to open, q to quit",
         app.mlt_files.len()
-    )));
-
+    );
+    let list = List::new(items).block(block_with_title(title));
     f.render_stateful_widget(list, f.area(), &mut app.file_list_state);
 }
 
-fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+fn render_tree_panel(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .tree_items
         .iter()
@@ -1070,9 +1015,9 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                                 OwnedGeometry::Decoded(g) => {
                                     let count = g.vector_types.len();
                                     let first = g.vector_types.first();
-                                    let all_same = first
-                                        .is_some_and(|f| g.vector_types.iter().all(|t| t == f));
-                                    let label = if all_same {
+                                    let label = if first
+                                        .is_some_and(|f| g.vector_types.iter().all(|t| t == f))
+                                    {
                                         format!("{:?}s", first.unwrap())
                                     } else {
                                         "features".to_string()
@@ -1095,8 +1040,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     let type_str =
                         geom_type.map_or_else(|| "Unknown".to_string(), |gt| format!("{gt:?}"));
                     let color = geom_type.map(get_geometry_type_color);
-
-                    let suffix = if let Some(g) = geom {
+                    let suffix = geom.map_or(String::new(), |g| {
                         let n_parts = get_multi_part_count(g, *feature_index);
                         if n_parts > 0 {
                             format!(" ({n_parts} parts)")
@@ -1109,10 +1053,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         } else {
                             String::new()
                         }
-                    } else {
-                        String::new()
-                    };
-
+                    });
                     (
                         format!("    Feat {feature_index}: {type_str}{suffix}"),
                         color,
@@ -1126,14 +1067,12 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     let geom = app.get_decoded_geometry(*layer_index);
                     let geom_type = geom.and_then(|g| g.vector_types.get(*feature_index).copied());
                     let color = geom_type.map(get_geometry_type_color);
-
                     let type_str = match geom_type {
                         Some(GeometryType::MultiPoint) => "Point",
                         Some(GeometryType::MultiLineString) => "LineString",
                         Some(GeometryType::MultiPolygon) => "Polygon",
                         _ => "Part",
                     };
-
                     let suffix = if matches!(
                         geom_type,
                         Some(GeometryType::MultiLineString | GeometryType::MultiPolygon)
@@ -1146,7 +1085,6 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     } else {
                         String::new()
                     };
-
                     (
                         format!("      Part {part_index}: {type_str}{suffix}"),
                         color,
@@ -1167,7 +1105,6 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-
             ListItem::new(Line::from(Span::styled(content, style)))
         })
         .collect();
@@ -1185,8 +1122,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         ViewMode::FileBrowser => "Layers & Features".to_string(),
     };
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-
+    let list = List::new(items).block(block_with_title(title));
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -1197,13 +1133,11 @@ fn get_multi_part_count(geom: &DecodedGeometry, feat_idx: usize) -> usize {
     };
     match geom_type {
         GeometryType::MultiPoint | GeometryType::MultiLineString | GeometryType::MultiPolygon => {
-            if let Some(g) = &geom.geometry_offsets {
+            geom.geometry_offsets.as_ref().map_or(0, |g| {
                 let start = g[feat_idx] as usize;
                 let end = g.get(feat_idx + 1).map_or(start, |&v| v as usize);
                 end.saturating_sub(start)
-            } else {
-                0
-            }
+            })
         }
         _ => 0,
     }
@@ -1225,21 +1159,14 @@ fn get_sub_feature_vertex_range(
     let abs_part = g[feat_idx] as usize + part_idx;
 
     match geom_type {
-        GeometryType::MultiPoint => {
-            // Each sub-part is a single point at vertex index abs_part
-            (abs_part, abs_part + 1)
-        }
-        GeometryType::MultiLineString => {
-            if let Some(p) = &geom.part_offsets {
-                let start = p[abs_part] as usize;
-                let end = p.get(abs_part + 1).map_or(n_verts, |&v| v as usize);
-                (start, end)
-            } else {
-                (0, 0)
-            }
-        }
-        GeometryType::MultiPolygon => {
-            if let (Some(p), Some(r)) = (&geom.part_offsets, &geom.ring_offsets) {
+        GeometryType::MultiPoint => (abs_part, abs_part + 1),
+        GeometryType::MultiLineString => geom.part_offsets.as_ref().map_or((0, 0), |p| {
+            let start = p[abs_part] as usize;
+            let end = p.get(abs_part + 1).map_or(n_verts, |&v| v as usize);
+            (start, end)
+        }),
+        GeometryType::MultiPolygon => match (&geom.part_offsets, &geom.ring_offsets) {
+            (Some(p), Some(r)) => {
                 let ring_start = p[abs_part] as usize;
                 let ring_end = p
                     .get(abs_part + 1)
@@ -1247,10 +1174,9 @@ fn get_sub_feature_vertex_range(
                 let start_vert = r[ring_start] as usize;
                 let end_vert = r.get(ring_end).map_or(n_verts, |&v| v as usize);
                 (start_vert, end_vert)
-            } else {
-                (0, 0)
             }
-        }
+            _ => (0, 0),
+        },
         _ => (0, 0),
     }
 }
@@ -1317,17 +1243,16 @@ fn get_feature_vertex_range(geom: &DecodedGeometry, feat_idx: usize) -> (usize, 
     }
 }
 
-fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn render_map_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     let selected_item = app.get_selected_item();
     let extent = app.get_extent();
     let (x_min, y_min, x_max, y_max) = app.calculate_bounds();
 
     let canvas = Canvas::default()
-        .block(Block::default().borders(Borders::ALL).title("Map View"))
+        .block(block_with_title("Map View"))
         .x_bounds([x_min, x_max])
         .y_bounds([y_min, y_max])
         .paint(|ctx| {
-            // Draw extent boundary
             ctx.draw(&ratatui::widgets::canvas::Rectangle {
                 x: 0.0,
                 y: 0.0,
@@ -1336,7 +1261,6 @@ fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 color: Color::DarkGray,
             });
 
-            // Draw geometries
             for (layer_idx, layer) in app.layers.iter().enumerate() {
                 if let OwnedLayer::Tag01(l) = layer {
                     if let OwnedGeometry::Decoded(geom) = &l.geometry {
@@ -1346,7 +1270,6 @@ fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                             TreeItem::Feature { layer_index, .. }
                             | TreeItem::SubFeature { layer_index, .. } => *layer_index == layer_idx,
                         };
-
                         if should_include_layer {
                             draw_geometry(
                                 ctx,
@@ -1400,29 +1323,28 @@ fn sub_part_color(
     }
 }
 
-/// Calculate winding order of a polygon ring
-/// Returns true for counter-clockwise (CCW), false for clockwise (CW)
+/// Calculate winding order of a polygon ring.
+/// Returns `true` for counter-clockwise (CCW), `false` for clockwise (CW).
 fn calculate_winding_order<F>(start: usize, end: usize, v: &F) -> bool
 where
     F: Fn(usize) -> Option<[f64; 2]>,
 {
-    let mut area = 0.0;
+    let mut area = 0.0_f64;
     for i in start..end.saturating_sub(1) {
         if let (Some([x1, y1]), Some([x2, y2])) = (v(i), v(i + 1)) {
             area += (x2 - x1) * (y2 + y1);
         }
     }
-    // Close the ring
     if end > start {
         if let (Some([x1, y1]), Some([x2, y2])) = (v(end - 1), v(start)) {
             area += (x2 - x1) * (y2 + y1);
         }
     }
-    area < 0.0 // CCW if negative
+    area < 0.0
 }
 
 fn draw_geometry(
-    ctx: &mut ratatui::widgets::canvas::Context<'_>,
+    ctx: &mut Context<'_>,
     geom: &DecodedGeometry,
     selected_item: &TreeItem,
     layer_idx: usize,
@@ -1430,16 +1352,11 @@ fn draw_geometry(
     tree_items: &[TreeItem],
 ) {
     let verts = geom.vertices.as_deref().unwrap_or(&[]);
-
     let v = |idx: usize| -> Option<[f64; 2]> {
-        if idx * 2 + 1 < verts.len() {
-            Some([f64::from(verts[idx * 2]), f64::from(verts[idx * 2 + 1])])
-        } else {
-            None
-        }
+        (idx * 2 + 1 < verts.len())
+            .then(|| [f64::from(verts[idx * 2]), f64::from(verts[idx * 2 + 1])])
     };
 
-    // Determine which sub-part is selected (if any)
     let selected_sub_part = match selected_item {
         TreeItem::SubFeature {
             layer_index,
@@ -1449,7 +1366,6 @@ fn draw_geometry(
         _ => None,
     };
 
-    // Determine which sub-part is hovered (if any)
     let hovered_sub_part = hovered_item.and_then(|&h_idx| match &tree_items[h_idx] {
         TreeItem::SubFeature {
             layer_index,
@@ -1472,24 +1388,18 @@ fn draw_geometry(
                 ..
             } => *layer_index == layer_idx && *feature_index == feat_idx,
         };
-
         if !should_include_feature {
             continue;
         }
 
-        // Check if the whole feature is hovered (not a sub-part)
         let is_hovered = hovered_item.is_some_and(|&h_idx| {
-            matches!(&tree_items[h_idx], TreeItem::Feature {
-                layer_index,
-                feature_index,
-            } if *layer_index == layer_idx && *feature_index == feat_idx)
+            matches!(&tree_items[h_idx], TreeItem::Feature { layer_index, feature_index }
+                if *layer_index == layer_idx && *feature_index == feat_idx)
         });
 
-        // Determine color based on hover state and geometry type
         let base_color = get_geometry_type_color(*geom_type);
         let color = if is_hovered { Color::White } else { base_color };
 
-        // Get the geometry coordinate ranges based on the type
         match (
             geom_type,
             &geom.geometry_offsets,
@@ -1527,14 +1437,16 @@ fn draw_geometry(
             }
             (GeometryType::LineString, _, Some(p), Some(r)) => {
                 let i = p[feat_idx] as usize;
-                let start = r[i] as usize;
-                let end = r[i + 1] as usize;
-                draw_line_string(ctx, start, end, &v, color);
+                draw_line_string(ctx, r[i] as usize, r[i + 1] as usize, &v, color);
             }
             (GeometryType::LineString, _, Some(p), None) => {
-                let start = p[feat_idx] as usize;
-                let end = p[feat_idx + 1] as usize;
-                draw_line_string(ctx, start, end, &v, color);
+                draw_line_string(
+                    ctx,
+                    p[feat_idx] as usize,
+                    p[feat_idx + 1] as usize,
+                    &v,
+                    color,
+                );
             }
             (GeometryType::Polygon, geoms, Some(p), Some(r)) => {
                 let (ring_start, ring_end) = if let Some(g) = geoms {
@@ -1546,18 +1458,13 @@ fn draw_geometry(
                 for ring_idx in ring_start..ring_end {
                     let start = r[ring_idx] as usize;
                     let end = r[ring_idx + 1] as usize;
-
                     let ring_color = if is_hovered {
                         color
+                    } else if calculate_winding_order(start, end, &v) {
+                        Color::Blue // CCW - typically outer ring
                     } else {
-                        let is_ccw = calculate_winding_order(start, end, &v);
-                        if is_ccw {
-                            Color::Blue // CCW - typically outer ring
-                        } else {
-                            Color::Red // CW - typically hole
-                        }
+                        Color::Red // CW - typically hole
                     };
-
                     draw_polygon_ring(ctx, start, end, &v, ring_color);
                 }
             }
@@ -1588,9 +1495,13 @@ fn draw_geometry(
                         rel_idx,
                         color,
                     );
-                    let line_start = p[part_idx] as usize;
-                    let line_end = p[part_idx + 1] as usize;
-                    draw_line_string(ctx, line_start, line_end, &v, part_color);
+                    draw_line_string(
+                        ctx,
+                        p[part_idx] as usize,
+                        p[part_idx + 1] as usize,
+                        &v,
+                        part_color,
+                    );
                 }
             }
             (GeometryType::MultiPolygon, Some(g), Some(p), Some(r)) => {
@@ -1608,19 +1519,13 @@ fn draw_geometry(
                     for ring_idx in rs..re {
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
-
-                        let ring_color =
-                            if part_color == Color::White || part_color == Color::Yellow {
-                                part_color
-                            } else {
-                                let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
-                                if is_ccw {
-                                    Color::Blue // CCW - typically outer ring
-                                } else {
-                                    Color::Red // CW - typically hole
-                                }
-                            };
-
+                        let ring_color = if matches!(part_color, Color::White | Color::Yellow) {
+                            part_color
+                        } else if calculate_winding_order(ring_start, ring_end, &v) {
+                            Color::Blue // CCW - typically outer ring
+                        } else {
+                            Color::Red // CW - typically hole
+                        };
                         draw_polygon_ring(ctx, ring_start, ring_end, &v, ring_color);
                     }
                 }
@@ -1630,13 +1535,8 @@ fn draw_geometry(
     }
 }
 
-fn draw_line_string<F>(
-    ctx: &mut ratatui::widgets::canvas::Context<'_>,
-    start: usize,
-    end: usize,
-    v: &F,
-    color: Color,
-) where
+fn draw_line_string<F>(ctx: &mut Context<'_>, start: usize, end: usize, v: &F, color: Color)
+where
     F: Fn(usize) -> Option<[f64; 2]>,
 {
     for i in start..end.saturating_sub(1) {
@@ -1652,13 +1552,8 @@ fn draw_line_string<F>(
     }
 }
 
-fn draw_polygon_ring<F>(
-    ctx: &mut ratatui::widgets::canvas::Context<'_>,
-    start: usize,
-    end: usize,
-    v: &F,
-    color: Color,
-) where
+fn draw_polygon_ring<F>(ctx: &mut Context<'_>, start: usize, end: usize, v: &F, color: Color)
+where
     F: Fn(usize) -> Option<[f64; 2]>,
 {
     draw_line_string(ctx, start, end, v, color);
