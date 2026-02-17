@@ -1,10 +1,15 @@
+#![cfg(feature = "cli")]
+
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mlt_nom::geojson::FeatureCollection;
 use mlt_nom::parse_layers;
+#[cfg(feature = "rayon")]
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 
 #[derive(Parser)]
 #[command(name = "mlt", about = "MapLibre Tile format utilities")]
@@ -68,9 +73,7 @@ enum LsFormat {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
-    match cli.command {
+    match Cli::parse().command {
         Commands::Dump(args) => dump(&args, false)?,
         Commands::Decode(args) => dump(&args, true)?,
         Commands::Ls(args) => ls(&args)?,
@@ -142,36 +145,21 @@ fn ls(args: &LsArgs) -> Result<(), Box<dyn std::error::Error>> {
         Path::new(".")
     };
 
-    // Process files in parallel
-    let infos: Vec<_> = {
-        #[cfg(feature = "cli")]
-        {
-            use rayon::prelude::*;
-            all_files
-                .par_iter()
-                .filter_map(|path| match analyze_mlt_file(path, base_path) {
-                    Ok(info) => Some(info),
-                    Err(e) => {
-                        eprintln!("Error analyzing {}: {}", path.display(), e);
-                        None
-                    }
-                })
-                .collect()
-        }
-        #[cfg(not(feature = "cli"))]
-        {
-            all_files
-                .iter()
-                .filter_map(|path| match analyze_mlt_file(path, base_path) {
-                    Ok(info) => Some(info),
-                    Err(e) => {
-                        eprintln!("Error analyzing {}: {}", path.display(), e);
-                        None
-                    }
-                })
-                .collect()
-        }
-    };
+    // Process files in parallel if rayon is enabled, otherwise sequentially
+    #[cfg(feature = "rayon")]
+    let all_files = all_files.par_iter();
+    #[cfg(not(feature = "rayon"))]
+    let all_files = all_files.iter();
+
+    let infos: Vec<_> = all_files
+        .filter_map(|path| match analyze_mlt_file(path, base_path) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("Error analyzing {}: {e}", path.display());
+                None
+            }
+        })
+        .collect();
 
     match args.format {
         LsFormat::Table => print_table(&infos),
@@ -188,7 +176,7 @@ fn collect_mlt_files(
     let mut files = Vec::new();
 
     if path.is_file() {
-        if path.extension().and_then(|s| s.to_str()) == Some("mlt") {
+        if path.extension().and_then(OsStr::to_str) == Some("mlt") {
             files.push(path.to_path_buf());
         }
     } else if path.is_dir() {
@@ -204,9 +192,7 @@ fn collect_from_dir(
     recursive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
+        let path = entry?.path();
         if path.is_file() {
             if path.extension().and_then(|s| s.to_str()) == Some("mlt") {
                 files.push(path);
@@ -215,7 +201,6 @@ fn collect_from_dir(
             collect_from_dir(&path, files, recursive)?;
         }
     }
-
     Ok(())
 }
 
@@ -228,7 +213,6 @@ fn analyze_mlt_file(
 
     // Parse without decoding first to count streams and compressions
     let layers_raw = parse_layers(&buffer)?;
-    let layer_count = layers_raw.len();
     let mut stream_count = 0;
     let mut compressions = HashSet::new();
 
@@ -267,7 +251,7 @@ fn analyze_mlt_file(
 
     let mut feature_count = 0;
     let mut geometries = HashSet::new();
-    let mut decompressed_size = 0;
+    let mut decoded_size = 0;
 
     for layer in &layers {
         if let Some(layer01) = layer.as_layer01() {
@@ -282,46 +266,46 @@ fn analyze_mlt_file(
 
                 // Calculate decompressed size from decoded data
                 if let Some(ref verts) = geom.vertices {
-                    decompressed_size += verts.len() * size_of::<i32>();
+                    decoded_size += verts.len() * size_of::<i32>();
                 }
                 if let Some(ref offsets) = geom.geometry_offsets {
-                    decompressed_size += offsets.len() * size_of::<u32>();
+                    decoded_size += offsets.len() * size_of::<u32>();
                 }
                 if let Some(ref offsets) = geom.part_offsets {
-                    decompressed_size += offsets.len() * size_of::<u32>();
+                    decoded_size += offsets.len() * size_of::<u32>();
                 }
                 if let Some(ref offsets) = geom.ring_offsets {
-                    decompressed_size += offsets.len() * size_of::<u32>();
+                    decoded_size += offsets.len() * size_of::<u32>();
                 }
                 if let Some(ref offsets) = geom.vertex_offsets {
-                    decompressed_size += offsets.len() * size_of::<u32>();
+                    decoded_size += offsets.len() * size_of::<u32>();
                 }
                 if let Some(ref buffer) = geom.index_buffer {
-                    decompressed_size += buffer.len() * size_of::<u32>();
+                    decoded_size += buffer.len() * size_of::<u32>();
                 }
                 if let Some(ref tris) = geom.triangles {
-                    decompressed_size += tris.len() * size_of::<u32>();
+                    decoded_size += tris.len() * size_of::<u32>();
                 }
             }
 
             // Add property data to decompressed size
             for prop in &layer01.properties {
                 if let mlt_nom::v01::Property::Decoded(decoded) = prop {
-                    decompressed_size += estimate_property_size(&decoded.values);
+                    decoded_size += estimate_property_size(&decoded.values);
                 }
             }
 
             // Add ID data to decompressed size
             if let mlt_nom::v01::Id::Decoded(ref decoded_id) = layer01.id {
                 if let Some(ref ids) = decoded_id.0 {
-                    decompressed_size += ids.len() * size_of::<u64>();
+                    decoded_size += ids.len() * size_of::<u64>();
                 }
             }
         }
     }
 
     // Calculate gzip size
-    let gzip_size = estimate_gzip_size(&buffer)?;
+    let gzipped_size = estimate_gzip_size(&buffer)?;
 
     // Format compression and geometry lists with abbreviations
     let compressions_str = format_compressions(&compressions);
@@ -344,15 +328,15 @@ fn analyze_mlt_file(
 
     // Calculate percentages
     #[allow(clippy::cast_precision_loss)]
-    let encoding_pct = if decompressed_size > 0 {
-        (original_size as f64 / decompressed_size as f64) * 100.0
+    let encoding_pct = if decoded_size > 0 {
+        (original_size as f64 / decoded_size as f64) * 100.0
     } else {
         0.0
     };
 
     #[allow(clippy::cast_precision_loss)]
     let gzip_pct = if original_size > 0 {
-        (gzip_size as f64 / original_size as f64) * 100.0
+        (gzipped_size as f64 / original_size as f64) * 100.0
     } else {
         0.0
     };
@@ -360,11 +344,11 @@ fn analyze_mlt_file(
     Ok(MltFileInfo {
         path: rel_path,
         size: original_size,
-        decoded_size: decompressed_size,
+        decoded_size,
         encoding_pct,
-        gzipped_size: gzip_size,
+        gzipped_size,
         gzip_pct,
-        layers: layer_count,
+        layers: layers_raw.len(),
         features: feature_count,
         streams: stream_count,
         compressions: compressions_str,
@@ -381,19 +365,15 @@ fn estimate_property_size(value: &mlt_nom::v01::PropValue) -> usize {
 }
 
 fn estimate_gzip_size(data: &[u8]) -> Result<usize, Box<dyn std::error::Error>> {
-    #[cfg(feature = "cli")]
-    {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write as _;
+    use std::io::Write as _;
 
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data)?;
-        let compressed = encoder.finish()?;
-        Ok(compressed.len())
-    }
-    #[cfg(not(feature = "cli"))]
-    Ok(data.len())
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    let compressed = encoder.finish()?;
+    Ok(compressed.len())
 }
 
 fn format_compressions(compressions: &HashSet<String>) -> String {
@@ -429,58 +409,49 @@ fn format_geometries(geometries: &HashSet<String>) -> String {
 }
 
 fn print_table(infos: &[MltFileInfo]) {
-    #[cfg(feature = "cli")]
-    {
-        use comfy_table::{Attribute, Cell, Table};
+    use comfy_table::{Attribute, Cell, Table};
 
-        let mut table = Table::new();
+    let mut table = Table::new();
 
-        // Load NOTHING preset to start clean
-        table.load_preset(comfy_table::presets::NOTHING);
-        // Set column separators to |
-        table.set_style(comfy_table::TableComponent::VerticalLines, '|');
-        // Set header separator
-        table.set_style(comfy_table::TableComponent::HeaderLines, '-');
-        table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '-');
+    // Load NOTHING preset to start clean
+    table.load_preset(comfy_table::presets::NOTHING);
+    // Set column separators to |
+    table.set_style(comfy_table::TableComponent::VerticalLines, '|');
+    // Set header separator
+    table.set_style(comfy_table::TableComponent::HeaderLines, '-');
+    table.set_style(comfy_table::TableComponent::MiddleHeaderIntersections, '-');
 
-        // Add header
-        table.set_header(vec![
-            Cell::new("File").add_attribute(Attribute::Bold),
-            Cell::new("Size").add_attribute(Attribute::Bold),
-            Cell::new("Decoded Size").add_attribute(Attribute::Bold),
-            Cell::new("Encoding %").add_attribute(Attribute::Bold),
-            Cell::new("Gzipped Size").add_attribute(Attribute::Bold),
-            Cell::new("Gzip %").add_attribute(Attribute::Bold),
-            Cell::new("Layers").add_attribute(Attribute::Bold),
-            Cell::new("Features").add_attribute(Attribute::Bold),
-            Cell::new("Streams").add_attribute(Attribute::Bold),
-            Cell::new("Compressions").add_attribute(Attribute::Bold),
-            Cell::new("Geometries").add_attribute(Attribute::Bold),
+    // Add header
+    table.set_header(vec![
+        Cell::new("File").add_attribute(Attribute::Bold),
+        Cell::new("Size").add_attribute(Attribute::Bold),
+        Cell::new("Decoded Size").add_attribute(Attribute::Bold),
+        Cell::new("Encoding %").add_attribute(Attribute::Bold),
+        Cell::new("Gzipped Size").add_attribute(Attribute::Bold),
+        Cell::new("Gzip %").add_attribute(Attribute::Bold),
+        Cell::new("Layers").add_attribute(Attribute::Bold),
+        Cell::new("Features").add_attribute(Attribute::Bold),
+        Cell::new("Streams").add_attribute(Attribute::Bold),
+        Cell::new("Compressions").add_attribute(Attribute::Bold),
+        Cell::new("Geometries").add_attribute(Attribute::Bold),
+    ]);
+
+    // Add rows
+    for info in infos {
+        table.add_row(vec![
+            Cell::new(&info.path),
+            Cell::new(info.size.to_string()),
+            Cell::new(info.decoded_size.to_string()),
+            Cell::new(format!("{:.1}", info.encoding_pct)),
+            Cell::new(info.gzipped_size.to_string()),
+            Cell::new(format!("{:.1}", info.gzip_pct)),
+            Cell::new(info.layers),
+            Cell::new(info.features),
+            Cell::new(info.streams),
+            Cell::new(&info.compressions),
+            Cell::new(&info.geometries),
         ]);
-
-        // Add rows
-        for info in infos {
-            table.add_row(vec![
-                Cell::new(&info.path),
-                Cell::new(info.size.to_string()),
-                Cell::new(info.decoded_size.to_string()),
-                Cell::new(format!("{:.1}", info.encoding_pct)),
-                Cell::new(info.gzipped_size.to_string()),
-                Cell::new(format!("{:.1}", info.gzip_pct)),
-                Cell::new(info.layers),
-                Cell::new(info.features),
-                Cell::new(info.streams),
-                Cell::new(&info.compressions),
-                Cell::new(&info.geometries),
-            ]);
-        }
-
-        println!("{table}");
     }
-    #[cfg(not(feature = "cli"))]
-    {
-        for info in infos {
-            println!("{:?}", info);
-        }
-    }
+
+    println!("{table}");
 }

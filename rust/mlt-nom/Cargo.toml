@@ -15,8 +15,9 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
-cli = ["dep:clap", "dep:comfy-table", "dep:rayon", "dep:flate2"]
+default = ["cli", "rayon"]
+cli = ["dep:clap", "dep:comfy-table", "dep:flate2"]
+rayon = ["dep:rayon"]
 
 [dependencies]
 #galileo-mvt = "0.2.1"

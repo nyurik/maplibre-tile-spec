@@ -97,54 +97,21 @@ impl Debug for PropValue {
 }
 
 impl PropValue {
-    /// Returns the size in bytes of the underlying element type for this variant
-    #[must_use]
-    pub const fn element_size(&self) -> usize {
-        use std::mem::size_of;
-        match self {
-            Self::Bool(_) => size_of::<bool>(),
-            Self::I8(_) => size_of::<i8>(),
-            Self::U8(_) => size_of::<u8>(),
-            Self::I32(_) => size_of::<i32>(),
-            Self::U32(_) => size_of::<u32>(),
-            Self::I64(_) => size_of::<i64>(),
-            Self::U64(_) => size_of::<u64>(),
-            Self::F32(_) => size_of::<f32>(),
-            Self::F64(_) => size_of::<f64>(),
-            Self::Str(_) | Self::Struct => 0,
-        }
-    }
-
-    /// Returns the length of the vector for this variant
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            Self::Bool(v) => v.len(),
-            Self::I8(v) => v.len(),
-            Self::U8(v) => v.len(),
-            Self::I32(v) => v.len(),
-            Self::U32(v) => v.len(),
-            Self::I64(v) => v.len(),
-            Self::U64(v) => v.len(),
-            Self::F32(v) => v.len(),
-            Self::F64(v) => v.len(),
-            Self::Str(v) => v.len(),
-            Self::Struct => 0,
-        }
-    }
-
-    /// Returns `true` if the property value contains no elements
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Returns the total estimated size in bytes for this property value
     #[must_use]
     pub fn estimated_size(&self) -> usize {
         match self {
+            Self::Bool(v) => size_of::<bool>() * v.len(),
+            Self::I8(v) => size_of::<i8>() * v.len(),
+            Self::U8(v) => size_of::<u8>() * v.len(),
+            Self::I32(v) => size_of::<i32>() * v.len(),
+            Self::U32(v) => size_of::<u32>() * v.len(),
+            Self::I64(v) => size_of::<i64>() * v.len(),
+            Self::U64(v) => size_of::<u64>() * v.len(),
+            Self::F32(v) => size_of::<f32>() * v.len(),
+            Self::F64(v) => size_of::<f64>() * v.len(),
             Self::Str(v) => v.iter().map(|s| s.as_ref().map_or(0, String::len)).sum(),
-            _ => self.len() * self.element_size(),
+            Self::Struct => 0,
         }
     }
 
