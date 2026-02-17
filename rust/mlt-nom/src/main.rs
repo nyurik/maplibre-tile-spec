@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::cli::dump::{AfterDump, DumpArgs, dump};
 use crate::cli::ls::{LsArgs, ls};
+use crate::cli::ui::{UiArgs, ui};
 mod cli;
 
 fn main() -> Result<()> {
@@ -12,13 +13,11 @@ fn main() -> Result<()> {
         Commands::Dump(args) => dump(&args, AfterDump::KeepRaw)?,
         Commands::Decode(args) => dump(&args, AfterDump::Decode)?,
         Commands::Ls(args) => ls(&args)?,
+        Commands::Ui(args) => ui(&args)?,
     }
 
     Ok(())
 }
-
-#[cfg(feature = "tui")]
-mod visualizer;
 
 #[derive(Parser)]
 #[command(name = "mlt", about = "MapLibre Tile format utilities")]
@@ -36,15 +35,7 @@ enum Commands {
     /// List .mlt files with statistics
     Ls(LsArgs),
     /// Visualize an MLT file in an interactive TUI
-    #[cfg(feature = "tui")]
-    Visualize(VisualizeArgs),
-}
-
-#[cfg(feature = "tui")]
-#[derive(Args)]
-struct VisualizeArgs {
-    /// Path to the MLT file or directory
-    path: PathBuf,
+    Ui(UiArgs),
 }
 
 #[derive(Clone, Default, ValueEnum)]

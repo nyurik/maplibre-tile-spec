@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{fs, io};
-
+use clap::Args;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -32,6 +32,18 @@ enum ViewMode {
     /// Layer overview mode - all layers shown
     LayerOverview,
 }
+
+#[derive(Args)]
+pub struct UiArgs {
+    /// Path to the MLT file or directory
+    path: PathBuf,
+}
+
+pub fn ui(args: &UiArgs) -> anyhow::Result<()> {
+    run_with_path(&args.path)?;
+    Ok(())
+}
+
 
 /// Represents a selectable item in the tree view
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +155,7 @@ impl App {
         }
     }
 
-    fn load_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fn load_file(&mut self, path: &Path) -> anyhow::Result<()> {
         let buffer = fs::read(path)?;
         let mut layers = parse_layers(&buffer)?;
 
@@ -281,7 +293,7 @@ impl App {
         }
     }
 
-    fn handle_enter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn handle_enter(&mut self) -> anyhow::Result<()> {
         match self.mode {
             ViewMode::FileBrowser => {
                 if let Some(file_path) = self.mlt_files.get(self.selected_file_index).cloned() {
@@ -686,7 +698,7 @@ impl App {
 /// Convert borrowed layers to owned layers
 fn convert_to_owned_layers(
     layers: &[Layer<'_>],
-) -> Result<Vec<OwnedLayer>, Box<dyn std::error::Error>> {
+) -> anyhow::Result<Vec<OwnedLayer>> {
     layers
         .iter()
         .filter_map(|layer| match layer {
@@ -698,7 +710,7 @@ fn convert_to_owned_layers(
 
 fn convert_layer01(
     l: &mlt_nom::v01::Layer01<'_>,
-) -> Result<OwnedLayer, Box<dyn std::error::Error>> {
+) -> anyhow::Result<OwnedLayer> {
     let properties = l
         .properties
         .iter()
@@ -706,9 +718,9 @@ fn convert_layer01(
             mlt_nom::v01::Property::Decoded(d) => {
                 Ok(mlt_nom::v01::OwnedProperty::Decoded(d.clone()))
             }
-            mlt_nom::v01::Property::Raw(_) => Err("Property not decoded".into()),
+            mlt_nom::v01::Property::Raw(_) => Err(anyhow::anyhow!("Property not decoded")),
         })
-        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(OwnedLayer::Tag01(mlt_nom::v01::OwnedLayer01 {
         name: l.name.to_string(),
         extent: l.extent,
@@ -718,15 +730,15 @@ fn convert_layer01(
         },
         geometry: match &l.geometry {
             mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
-            mlt_nom::v01::Geometry::Raw(_) => return Err("Geometry not decoded".into()),
+            mlt_nom::v01::Geometry::Raw(_) => return Err(anyhow::anyhow!("Geometry not decoded")),
         },
         properties,
     }))
 }
 
 /// Recursively find all .mlt files in a directory
-fn find_mlt_files(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+fn find_mlt_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    fn visit_dir(dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
         if dir.is_dir() {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
@@ -748,12 +760,12 @@ fn find_mlt_files(dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>
 }
 
 /// Run the TUI application with a path (file or directory)
-pub fn run_with_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_with_path(path: &Path) -> anyhow::Result<()> {
     if path.is_dir() {
         // Directory mode - browse files
         let mlt_files = find_mlt_files(path)?;
         if mlt_files.is_empty() {
-            return Err("No .mlt files found in directory".into());
+            anyhow::bail!("No .mlt files found in directory");
         }
         let app = App::new_file_browser(mlt_files);
         run_app(app)
@@ -774,12 +786,12 @@ pub fn run_with_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         app.build_tree_items();
         run_app(app)
     } else {
-        Err("Path is not a file or directory".into())
+        Err(anyhow::anyhow!("Path is not a file or directory"))
     }
 }
 
 /// Main application loop
-fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
+fn run_app(mut app: App) -> anyhow::Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
