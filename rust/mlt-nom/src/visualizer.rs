@@ -44,7 +44,7 @@ enum TreeItem {
         layer_index: usize,
         feature_index: usize,
     },
-    /// A sub-part of a multi-geometry feature (e.g. one polygon within a MultiPolygon)
+    /// A sub-part of a multi-geometry feature (e.g. one polygon within a `MultiPolygon`)
     SubFeature {
         layer_index: usize,
         feature_index: usize,
@@ -72,6 +72,9 @@ struct App {
     expanded_layers: Vec<bool>,
     // Expansion state for multi-geometry features (layer_index, feature_index)
     expanded_features: HashSet<(usize, usize)>,
+    // Scroll acceleration state
+    last_scroll_time: Instant,
+    scroll_speed: usize,
 }
 
 impl App {
@@ -93,6 +96,8 @@ impl App {
             mouse_pos: None,
             expanded_layers: Vec::new(),
             expanded_features: HashSet::new(),
+            last_scroll_time: Instant::now(),
+            scroll_speed: 1,
         }
     }
 
@@ -122,6 +127,8 @@ impl App {
             mouse_pos: None,
             expanded_layers,
             expanded_features: HashSet::new(),
+            last_scroll_time: Instant::now(),
+            scroll_speed: 1,
         }
     }
 
@@ -196,36 +203,52 @@ impl App {
         }
     }
 
+    fn scroll_step(&mut self) -> usize {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_scroll_time);
+        self.last_scroll_time = now;
+        if elapsed.as_millis() < 50 {
+            self.scroll_speed = (self.scroll_speed + 1).min(20);
+        } else if elapsed.as_millis() < 120 {
+            self.scroll_speed = self.scroll_speed.max(2);
+        } else {
+            self.scroll_speed = 1;
+        }
+        self.scroll_speed
+    }
+
     fn move_up(&mut self) {
+        self.move_up_by(1);
+    }
+
+    fn move_up_by(&mut self, n: usize) {
         match self.mode {
             ViewMode::FileBrowser => {
-                if self.selected_file_index > 0 {
-                    self.selected_file_index -= 1;
-                    self.file_list_state.select(Some(self.selected_file_index));
-                }
+                self.selected_file_index = self.selected_file_index.saturating_sub(n);
+                self.file_list_state.select(Some(self.selected_file_index));
             }
             ViewMode::LayerOverview => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                    self.list_state.select(Some(self.selected_index));
-                }
+                self.selected_index = self.selected_index.saturating_sub(n);
+                self.list_state.select(Some(self.selected_index));
             }
         }
     }
 
     fn move_down(&mut self) {
+        self.move_down_by(1);
+    }
+
+    fn move_down_by(&mut self, n: usize) {
         match self.mode {
             ViewMode::FileBrowser => {
-                if self.selected_file_index < self.mlt_files.len().saturating_sub(1) {
-                    self.selected_file_index += 1;
-                    self.file_list_state.select(Some(self.selected_file_index));
-                }
+                let max = self.mlt_files.len().saturating_sub(1);
+                self.selected_file_index = (self.selected_file_index + n).min(max);
+                self.file_list_state.select(Some(self.selected_file_index));
             }
             ViewMode::LayerOverview => {
-                if self.selected_index < self.tree_items.len().saturating_sub(1) {
-                    self.selected_index += 1;
-                    self.list_state.select(Some(self.selected_index));
-                }
+                let max = self.tree_items.len().saturating_sub(1);
+                self.selected_index = (self.selected_index + n).min(max);
+                self.list_state.select(Some(self.selected_index));
             }
         }
     }
@@ -546,10 +569,10 @@ impl App {
                         TreeItem::AllLayers => true,
                         TreeItem::Layer { index } => *layer_index == *index,
                         TreeItem::Feature {
-                            layer_index: sel_li,
-                            feature_index: sel_fi,
-                        } => *layer_index == *sel_li && *feature_index == *sel_fi,
-                        _ => false,
+                            layer_index: sel_layer,
+                            feature_index: sel_feat,
+                        } => *layer_index == *sel_layer && *feature_index == *sel_feat,
+                        TreeItem::SubFeature { .. } => false,
                     };
                     if !is_visible {
                         continue;
@@ -571,14 +594,14 @@ impl App {
                 } => {
                     let is_visible = match &selected_item {
                         TreeItem::Feature {
-                            layer_index: sel_li,
-                            feature_index: sel_fi,
+                            layer_index: sel_layer,
+                            feature_index: sel_feat,
                         }
                         | TreeItem::SubFeature {
-                            layer_index: sel_li,
-                            feature_index: sel_fi,
+                            layer_index: sel_layer,
+                            feature_index: sel_feat,
                             ..
-                        } => *layer_index == *sel_li && *feature_index == *sel_fi,
+                        } => *layer_index == *sel_layer && *feature_index == *sel_feat,
                         _ => false,
                     };
                     if !is_visible {
@@ -885,7 +908,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Enter => {
                                 app.handle_enter()?;
                             }
-                            KeyCode::Char('+') | KeyCode::Char('=') => app.handle_plus(),
+                            KeyCode::Char('+' | '=') => app.handle_plus(),
                             KeyCode::Char('-') => app.handle_minus(),
                             KeyCode::Char('*') => app.handle_star(),
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
@@ -909,14 +932,13 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             // Disable hover when viewing a single non-expandable item.
                             // Enable hover when a multi-geometry feature is expanded
                             // (so sub-parts can be hovered/selected).
-                            let hover_disabled = match app.tree_items.get(app.selected_index) {
+                            let hover_disabled = matches!(
+                                app.tree_items.get(app.selected_index),
                                 Some(TreeItem::Feature {
                                     layer_index,
                                     feature_index,
-                                }) => !app.expanded_features.contains(&(*layer_index, *feature_index)),
-                                Some(TreeItem::SubFeature { .. }) => false,
-                                _ => false,
-                            };
+                                }) if !app.expanded_features.contains(&(*layer_index, *feature_index))
+                            );
 
                             if app.mode == ViewMode::LayerOverview && !hover_disabled {
                                 // Check if mouse is over the tree panel
@@ -965,8 +987,14 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        MouseEventKind::ScrollUp => app.move_up(),
-                        MouseEventKind::ScrollDown => app.move_down(),
+                        MouseEventKind::ScrollUp => {
+                            let step = app.scroll_step();
+                            app.move_up_by(step);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            let step = app.scroll_step();
+                            app.move_down_by(step);
+                        }
                         MouseEventKind::Down(_button) => {
                             if app.mode == ViewMode::FileBrowser {
                                 let area = terminal.get_frame().area();
@@ -1120,7 +1148,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                                     };
                                     (count, label)
                                 }
-                                _ => (0, "features".to_string()),
+                                OwnedGeometry::Raw(_) => (0, "features".to_string()),
                             };
                             (format!("  Layer: {} ({count} {label})", l.name), None)
                         }
@@ -1279,9 +1307,8 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
 /// Return the number of sub-parts for a multi-geometry feature, or 0 if not a multi-type.
 fn get_multi_part_count(geom: &DecodedGeometry, feat_idx: usize) -> usize {
-    let geom_type = match geom.vector_types.get(feat_idx) {
-        Some(gt) => gt,
-        None => return 0,
+    let Some(geom_type) = geom.vector_types.get(feat_idx) else {
+        return 0;
     };
     match geom_type {
         GeometryType::MultiPoint | GeometryType::MultiLineString | GeometryType::MultiPolygon => {
@@ -1304,13 +1331,11 @@ fn get_sub_feature_vertex_range(
     part_idx: usize,
 ) -> (usize, usize) {
     let n_verts = geom.vertices.as_deref().map_or(0, |v| v.len() / 2);
-    let geom_type = match geom.vector_types.get(feat_idx) {
-        Some(gt) => gt,
-        None => return (0, 0),
+    let Some(geom_type) = geom.vector_types.get(feat_idx) else {
+        return (0, 0);
     };
-    let g = match &geom.geometry_offsets {
-        Some(g) => g,
-        None => return (0, 0),
+    let Some(g) = &geom.geometry_offsets else {
+        return (0, 0);
     };
     let abs_part = g[feat_idx] as usize + part_idx;
 
@@ -1468,7 +1493,7 @@ fn get_geometry_type_color(geom_type: GeometryType) -> Color {
 }
 
 /// Determine the color for a sub-part of a multi-geometry.
-/// Selected sub-part gets Yellow, hovered gets White, others get DarkGray when
+/// Selected sub-part gets Yellow, hovered gets White, others get `DarkGray` when
 /// a sub-part is selected/hovered, or the base color otherwise.
 fn sub_part_color(
     selected: Option<(usize, usize)>,
@@ -1555,8 +1580,8 @@ fn draw_geometry(
             TreeItem::Feature {
                 layer_index,
                 feature_index,
-            } => *layer_index == layer_idx && *feature_index == feat_idx,
-            TreeItem::SubFeature {
+            }
+            | TreeItem::SubFeature {
                 layer_index,
                 feature_index,
                 ..
