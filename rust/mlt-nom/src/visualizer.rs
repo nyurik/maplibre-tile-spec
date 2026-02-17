@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -399,8 +400,9 @@ impl App {
     }
 
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
-        // Simple hit test: find feature whose bounding box contains the point
+        let selected_item = self.get_selected_item().clone();
         let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02; // 2% of view size
+        let mut best: Option<(usize, f64)> = None; // (tree_index, distance²)
 
         for (idx, item) in self.tree_items.iter().enumerate() {
             if let TreeItem::Feature {
@@ -408,22 +410,38 @@ impl App {
                 feature_index,
             } = item
             {
+                // Only consider features that are actually visible on the map
+                let is_visible = match &selected_item {
+                    TreeItem::AllLayers => true,
+                    TreeItem::Layer { index } => *layer_index == *index,
+                    TreeItem::Feature {
+                        layer_index: sel_li,
+                        feature_index: sel_fi,
+                    } => *layer_index == *sel_li && *feature_index == *sel_fi,
+                };
+                if !is_visible {
+                    continue;
+                }
+
                 if let OwnedLayer::Tag01(l) = &self.layers[*layer_index] {
                     if let OwnedGeometry::Decoded(geom) = &l.geometry {
                         let verts = geom.vertices.as_deref().unwrap_or(&[]);
+                        let (start, end) = get_feature_vertex_range(geom, *feature_index);
 
-                        // Check if any vertex is near the cursor
-                        for i in (0..(verts.len() / 2)).map(|i| i * 2) {
+                        for vi in start..end {
+                            let i = vi * 2;
+                            if i + 1 >= verts.len() {
+                                break;
+                            }
                             let x = f64::from(verts[i]);
                             let y = f64::from(verts[i + 1]);
                             let dx = (x - canvas_x).abs();
                             let dy = (y - canvas_y).abs();
 
                             if dx < threshold && dy < threshold {
-                                // Check if this vertex belongs to our feature
-                                if Self::vertex_belongs_to_feature(geom, *feature_index, i / 2) {
-                                    self.hovered_item = Some(idx);
-                                    return;
+                                let dist2 = dx * dx + dy * dy;
+                                if best.is_none_or(|(_, d)| dist2 < d) {
+                                    best = Some((idx, dist2));
                                 }
                             }
                         }
@@ -431,17 +449,7 @@ impl App {
                 }
             }
         }
-        self.hovered_item = None;
-    }
-
-    fn vertex_belongs_to_feature(
-        _geom: &DecodedGeometry,
-        _feature_idx: usize,
-        _vertex_idx: usize,
-    ) -> bool {
-        // Simplified: assume all vertices in range belong to feature
-        // In a full implementation, we'd check geometry_offsets, part_offsets, etc.
-        true
+        self.hovered_item = best.map(|(idx, _)| idx);
     }
 
     /// Get the extent from the first layer, or use a default
@@ -468,30 +476,41 @@ impl App {
         let mut max_x = f64::NEG_INFINITY;
         let mut max_y = f64::NEG_INFINITY;
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            match layer {
-                OwnedLayer::Tag01(l) => {
-                    if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                        let should_include_layer = match selected_item {
-                            TreeItem::AllLayers => true,
-                            TreeItem::Layer { index } => *index == layer_idx,
-                            TreeItem::Feature { layer_index, .. } => *layer_index == layer_idx,
-                        };
+        let mut update = |verts: &[i32], start: usize, end: usize| {
+            for vi in start..end {
+                let i = vi * 2;
+                if i + 1 < verts.len() {
+                    let x = f64::from(verts[i]);
+                    let y = f64::from(verts[i + 1]);
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        };
 
-                        if should_include_layer {
-                            let verts = geom.vertices.as_deref().unwrap_or(&[]);
-                            for i in (0..verts.len()).step_by(2) {
-                                let x = f64::from(verts[i]);
-                                let y = f64::from(verts[i + 1]);
-                                min_x = min_x.min(x);
-                                min_y = min_y.min(y);
-                                max_x = max_x.max(x);
-                                max_y = max_y.max(y);
-                            }
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if let OwnedLayer::Tag01(l) = layer {
+                if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                    let verts = geom.vertices.as_deref().unwrap_or(&[]);
+                    match selected_item {
+                        TreeItem::AllLayers => {
+                            update(verts, 0, verts.len() / 2);
                         }
+                        TreeItem::Layer { index } if *index == layer_idx => {
+                            update(verts, 0, verts.len() / 2);
+                        }
+                        TreeItem::Feature {
+                            layer_index,
+                            feature_index,
+                        } if *layer_index == layer_idx => {
+                            let (start, end) = get_feature_vertex_range(geom, *feature_index);
+                            update(verts, start, end);
+                        }
+                        _ => {}
                     }
                 }
-                OwnedLayer::Unknown(_) => {}
             }
         }
 
@@ -633,6 +652,8 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut map_area: Option<Rect> = None;
+    let mut tree_area: Option<Rect> = None;
+    let mut last_tree_click: Option<(Instant, usize)> = None; // (time, row)
 
     loop {
         terminal.draw(|f| {
@@ -652,7 +673,8 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                     // Render map panel
                     render_map_panel(f, chunks[1], &app);
 
-                    // Store map area for mouse event handling
+                    // Store areas for mouse event handling
+                    tree_area = Some(chunks[0]);
                     map_area = Some(chunks[1]);
                 }
             }
@@ -724,11 +746,60 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                         MouseEventKind::ScrollUp => app.move_up(),
                         MouseEventKind::ScrollDown => app.move_down(),
                         MouseEventKind::Down(_button) => {
-                            // Handle clicks in tree panel
                             if app.mode == ViewMode::LayerOverview {
-                                // We need to check if click is in tree area
-                                // For now, just implement for the list items
-                                // This requires tracking the tree panel area
+                                if let Some(area) = tree_area {
+                                    // Check click is inside the tree panel content area (inside borders)
+                                    let content_y = area.y + 1; // top border
+                                    let content_bottom = area.y + area.height.saturating_sub(1);
+                                    if mouse.column >= area.x
+                                        && mouse.column < area.x + area.width
+                                        && mouse.row >= content_y
+                                        && mouse.row < content_bottom
+                                    {
+                                        let scroll_offset =
+                                            app.list_state.offset();
+                                        let clicked_row =
+                                            (mouse.row - content_y) as usize + scroll_offset;
+                                        if clicked_row < app.tree_items.len() {
+                                            // Detect double-click on same row
+                                            let is_double = last_tree_click.is_some_and(
+                                                |(t, row)| {
+                                                    row == clicked_row
+                                                        && t.elapsed().as_millis() < 400
+                                                },
+                                            );
+                                            last_tree_click = Some((Instant::now(), clicked_row));
+
+                                            app.selected_index = clicked_row;
+                                            app.list_state.select(Some(clicked_row));
+
+                                            if is_double {
+                                                if let Some(TreeItem::Layer { index }) =
+                                                    app.tree_items.get(clicked_row)
+                                                {
+                                                    if *index < app.expanded_layers.len() {
+                                                        app.expanded_layers[*index] =
+                                                            !app.expanded_layers[*index];
+                                                        app.build_tree_items();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Click on hovered feature in the map selects it
+                                if let Some(hovered) = app.hovered_item {
+                                    if let Some(area) = map_area {
+                                        if mouse.column >= area.x
+                                            && mouse.column < area.x + area.width
+                                            && mouse.row >= area.y
+                                            && mouse.row < area.y + area.height
+                                        {
+                                            app.selected_index = hovered;
+                                            app.list_state.select(Some(hovered));
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -797,7 +868,27 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 TreeItem::Layer { index } => {
                     let layer = &app.layers[*index];
                     match layer {
-                        OwnedLayer::Tag01(l) => (format!("  Layer: {}", l.name), None),
+                        OwnedLayer::Tag01(l) => {
+                            let (count, label) = match &l.geometry {
+                                OwnedGeometry::Decoded(g) => {
+                                    let count = g.vector_types.len();
+                                    let first = g.vector_types.first();
+                                    let all_same =
+                                        first.is_some_and(|f| g.vector_types.iter().all(|t| t == f));
+                                    let label = if all_same {
+                                        format!("{:?}s", first.unwrap())
+                                    } else {
+                                        "features".to_string()
+                                    };
+                                    (count, label)
+                                }
+                                _ => (0, "features".to_string()),
+                            };
+                            (
+                                format!("  Layer: {} ({count} {label})", l.name),
+                                None,
+                            )
+                        }
                         OwnedLayer::Unknown(_) => (format!("  Layer {index}"), None),
                     }
                 }
@@ -805,23 +896,14 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     layer_index,
                     feature_index,
                 } => {
-                    // Get geometry type and calculate size
-                    let (geom_type, size) = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index]
-                    {
+                    let geom_type = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
                         if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            if *feature_index < geom.vector_types.len() {
-                                let geom_type = &geom.vector_types[*feature_index];
-                                // Calculate size (number of vertices)
-                                let size = calculate_feature_size(geom, *feature_index);
-                                (Some(*geom_type), size)
-                            } else {
-                                (None, 0)
-                            }
+                            geom.vector_types.get(*feature_index).copied()
                         } else {
-                            (None, 0)
+                            None
                         }
                     } else {
-                        (None, 0)
+                        None
                     };
 
                     let type_str = if let Some(gt) = geom_type {
@@ -833,7 +915,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     let color = geom_type.map(get_geometry_type_color);
 
                     (
-                        format!("    Feat {feature_index}: {type_str} ({size}v)"),
+                        format!("    Feat {feature_index}: {type_str}"),
                         color,
                     )
                 }
@@ -875,43 +957,65 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-/// Calculate the number of vertices for a feature
-fn calculate_feature_size(geom: &DecodedGeometry, feature_idx: usize) -> usize {
-    let verts = geom.vertices.as_deref().unwrap_or(&[]);
+/// Return the (start, end) vertex index range for a given feature.
+fn get_feature_vertex_range(geom: &DecodedGeometry, feat_idx: usize) -> (usize, usize) {
+    let n_verts = geom.vertices.as_deref().map_or(0, |v| v.len() / 2);
+    let n_feats = geom.vector_types.len();
 
-    // This is a simplified calculation - we just count all vertices for now
-    // A more accurate version would parse through the offsets
     match (
         &geom.geometry_offsets,
         &geom.part_offsets,
         &geom.ring_offsets,
     ) {
-        (Some(g), Some(p), Some(r)) if feature_idx < g.len().saturating_sub(1) => {
-            let start_part = g[feature_idx] as usize;
-            let end_part = g[feature_idx + 1] as usize;
-            if start_part < p.len() && end_part <= p.len() {
-                let start_ring = p[start_part] as usize;
-                let end_ring = p[end_part.min(p.len() - 1)] as usize;
-                if start_ring < r.len() && end_ring <= r.len() {
-                    let start_vert = r[start_ring] as usize;
-                    let end_vert = if end_ring < r.len() {
-                        r[end_ring] as usize
-                    } else {
-                        verts.len() / 2
-                    };
-                    return end_vert.saturating_sub(start_vert);
-                }
-            }
-            0
+        (Some(g), Some(p), Some(r)) => {
+            let start_part = g[feat_idx] as usize;
+            let end_part = g
+                .get(feat_idx + 1)
+                .map_or(p.len().saturating_sub(1), |&v| v as usize);
+            let start_ring = p[start_part] as usize;
+            let end_ring = p
+                .get(end_part)
+                .map_or(r.len().saturating_sub(1), |&v| v as usize);
+            let start_vert = r[start_ring] as usize;
+            let end_vert = r.get(end_ring).map_or(n_verts, |&v| v as usize);
+            (start_vert, end_vert)
         }
-        _ => {
-            // Simplified: just return total vertex count divided by feature count
-            if geom.vector_types.is_empty() {
-                0
-            } else {
-                (verts.len() / 2) / geom.vector_types.len()
-            }
+        (Some(g), Some(p), None) => {
+            let start_part = g[feat_idx] as usize;
+            let end_part = g
+                .get(feat_idx + 1)
+                .map_or(p.len().saturating_sub(1), |&v| v as usize);
+            let start_vert = p[start_part] as usize;
+            let end_vert = p.get(end_part).map_or(n_verts, |&v| v as usize);
+            (start_vert, end_vert)
         }
+        (Some(g), None, None) => {
+            let start = g[feat_idx] as usize;
+            let end = g.get(feat_idx + 1).map_or(n_verts, |&v| v as usize);
+            (start, end)
+        }
+        (None, Some(p), Some(r)) => {
+            let start_ring = p[feat_idx] as usize;
+            let end_ring = p
+                .get(feat_idx + 1)
+                .map_or(r.len().saturating_sub(1), |&v| v as usize);
+            let start_vert = r[start_ring] as usize;
+            let end_vert = r.get(end_ring).map_or(n_verts, |&v| v as usize);
+            (start_vert, end_vert)
+        }
+        (None, Some(p), None) => {
+            let start = p[feat_idx] as usize;
+            let end = p.get(feat_idx + 1).map_or(n_verts, |&v| v as usize);
+            (start, end)
+        }
+        (None, None, None) => {
+            if n_feats == 0 {
+                return (0, 0);
+            }
+            let per_feat = n_verts / n_feats;
+            (feat_idx * per_feat, (feat_idx + 1) * per_feat)
+        }
+        _ => (0, n_verts),
     }
 }
 
