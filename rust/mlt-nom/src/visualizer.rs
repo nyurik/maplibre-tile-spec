@@ -288,33 +288,31 @@ impl App {
                     self.load_file(&file_path)?;
                 }
             }
-            ViewMode::LayerOverview => {
-                match self.tree_items.get(self.selected_index) {
-                    Some(TreeItem::Layer { index }) => {
-                        if *index < self.expanded_layers.len() {
-                            self.expanded_layers[*index] = !self.expanded_layers[*index];
-                            self.build_tree_items();
-                            self.invalidate();
-                        }
+            ViewMode::LayerOverview => match self.tree_items.get(self.selected_index) {
+                Some(TreeItem::Layer { index }) => {
+                    if *index < self.expanded_layers.len() {
+                        self.expanded_layers[*index] = !self.expanded_layers[*index];
+                        self.build_tree_items();
+                        self.invalidate();
                     }
-                    Some(TreeItem::Feature {
-                        layer_index,
-                        feature_index,
-                    }) => {
-                        let key = (*layer_index, *feature_index);
-                        if self.is_multi_geometry(*layer_index, *feature_index) {
-                            if self.expanded_features.contains(&key) {
-                                self.expanded_features.remove(&key);
-                            } else {
-                                self.expanded_features.insert(key);
-                            }
-                            self.build_tree_items();
-                            self.invalidate();
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                Some(TreeItem::Feature {
+                    layer_index,
+                    feature_index,
+                }) => {
+                    let key = (*layer_index, *feature_index);
+                    if self.is_multi_geometry(*layer_index, *feature_index) {
+                        if self.expanded_features.contains(&key) {
+                            self.expanded_features.remove(&key);
+                        } else {
+                            self.expanded_features.insert(key);
+                        }
+                        self.build_tree_items();
+                        self.invalidate();
+                    }
+                }
+                _ => {}
+            },
         }
         Ok(())
     }
@@ -337,7 +335,9 @@ impl App {
     /// Rebuild tree items after expansion state changes, clamping selection.
     fn rebuild_and_clamp(&mut self) {
         self.build_tree_items();
-        self.selected_index = self.selected_index.min(self.tree_items.len().saturating_sub(1));
+        self.selected_index = self
+            .selected_index
+            .min(self.tree_items.len().saturating_sub(1));
         self.list_state.select(Some(self.selected_index));
         self.invalidate_bounds();
     }
@@ -371,9 +371,7 @@ impl App {
                 feature_index,
             }) => {
                 let key = (*layer_index, *feature_index);
-                if self.is_multi_geometry(key.0, key.1)
-                    && !self.expanded_features.contains(&key)
-                {
+                if self.is_multi_geometry(key.0, key.1) && !self.expanded_features.contains(&key) {
                     self.expanded_features.insert(key);
                     self.build_tree_items();
                     self.invalidate();
@@ -406,9 +404,9 @@ impl App {
                     && self.expanded_layers[layer_index]
                 {
                     self.expanded_layers[layer_index] = false;
-                    self.rebuild_and_select(|item| {
-                        matches!(item, TreeItem::Layer { index } if *index == layer_index)
-                    });
+                    self.rebuild_and_select(
+                        |item| matches!(item, TreeItem::Layer { index } if *index == layer_index),
+                    );
                 }
             }
             Some(TreeItem::SubFeature {
@@ -491,9 +489,10 @@ impl App {
                 matches!(t, TreeItem::Feature { layer_index: li, feature_index: fi }
                     if *li == layer_index && *fi == feature_index)
             }),
-            TreeItem::Feature { layer_index, .. } => self.tree_items.iter().position(|t| {
-                matches!(t, TreeItem::Layer { index } if *index == layer_index)
-            }),
+            TreeItem::Feature { layer_index, .. } => self
+                .tree_items
+                .iter()
+                .position(|t| matches!(t, TreeItem::Layer { index } if *index == layer_index)),
             TreeItem::Layer { .. } => Some(0),
             TreeItem::AllLayers => {
                 if !self.mlt_files.is_empty() {
@@ -523,7 +522,10 @@ impl App {
                     layer_index,
                     feature_index,
                 } => {
-                    if self.expanded_features.contains(&(*layer_index, *feature_index)) {
+                    if self
+                        .expanded_features
+                        .contains(&(*layer_index, *feature_index))
+                    {
                         continue;
                     }
                     let visible = match &selected_item {
@@ -793,23 +795,21 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if app.needs_redraw {
             app.needs_redraw = false;
-            terminal.draw(|f| {
-                match app.mode {
-                    ViewMode::FileBrowser => {
-                        render_file_browser(f, &mut app);
-                    }
-                    ViewMode::LayerOverview => {
-                        let chunks = Layout::default()
-                            .direction(Direction::Horizontal)
-                            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-                            .split(f.area());
+            terminal.draw(|f| match app.mode {
+                ViewMode::FileBrowser => {
+                    render_file_browser(f, &mut app);
+                }
+                ViewMode::LayerOverview => {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                        .split(f.area());
 
-                        render_tree_panel(f, chunks[0], &mut app);
-                        render_map_panel(f, chunks[1], &app);
+                    render_tree_panel(f, chunks[0], &mut app);
+                    render_map_panel(f, chunks[1], &app);
 
-                        tree_area = Some(chunks[0]);
-                        map_area = Some(chunks[1]);
-                    }
+                    tree_area = Some(chunks[0]);
+                    map_area = Some(chunks[1]);
                 }
             })?;
         }
@@ -847,81 +847,22 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::Moved => {
-                            app.mouse_pos = Some((mouse.column, mouse.row));
-                            let prev_hovered = app.hovered_item;
-                            app.hovered_item = None;
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Moved => {
+                        app.mouse_pos = Some((mouse.column, mouse.row));
+                        let prev_hovered = app.hovered_item;
+                        app.hovered_item = None;
 
-                            let hover_disabled = matches!(
-                                app.tree_items.get(app.selected_index),
-                                Some(TreeItem::Feature {
-                                    layer_index,
-                                    feature_index,
-                                }) if !app.expanded_features.contains(&(*layer_index, *feature_index))
-                            );
+                        let hover_disabled = matches!(
+                            app.tree_items.get(app.selected_index),
+                            Some(TreeItem::Feature {
+                                layer_index,
+                                feature_index,
+                            }) if !app.expanded_features.contains(&(*layer_index, *feature_index))
+                        );
 
-                            if app.mode == ViewMode::LayerOverview && !hover_disabled {
-                                if let Some(area) = tree_area {
-                                    let content_y = area.y + 1;
-                                    let content_bottom = area.y + area.height.saturating_sub(1);
-                                    if mouse.column >= area.x
-                                        && mouse.column < area.x + area.width
-                                        && mouse.row >= content_y
-                                        && mouse.row < content_bottom
-                                    {
-                                        let scroll_offset = app.list_state.offset();
-                                        let row = (mouse.row - content_y) as usize + scroll_offset;
-                                        if row < app.tree_items.len()
-                                            && matches!(
-                                                app.tree_items[row],
-                                                TreeItem::Feature { .. }
-                                                    | TreeItem::SubFeature { .. }
-                                            )
-                                        {
-                                            app.hovered_item = Some(row);
-                                        }
-                                    }
-                                }
-
-                                if app.hovered_item.is_none() {
-                                    if let Some(area) = map_area {
-                                        if mouse.column >= area.x
-                                            && mouse.column < area.x + area.width
-                                            && mouse.row >= area.y
-                                            && mouse.row < area.y + area.height
-                                        {
-                                            let bounds = app.get_bounds();
-                                            let rel_x = f64::from(mouse.column - area.x)
-                                                / f64::from(area.width);
-                                            let rel_y = f64::from(mouse.row - area.y)
-                                                / f64::from(area.height);
-
-                                            let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
-                                            let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1);
-
-                                            app.find_hovered_feature(canvas_x, canvas_y, bounds);
-                                        }
-                                    }
-                                }
-                            }
-
-                            if app.hovered_item != prev_hovered {
-                                app.invalidate();
-                            }
-                        }
-                        MouseEventKind::ScrollUp => {
-                            let step = app.scroll_step();
-                            app.move_up_by(step);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            let step = app.scroll_step();
-                            app.move_down_by(step);
-                        }
-                        MouseEventKind::Down(_button) => {
-                            if app.mode == ViewMode::FileBrowser {
-                                let area = terminal.get_frame().area();
+                        if app.mode == ViewMode::LayerOverview && !hover_disabled {
+                            if let Some(area) = tree_area {
                                 let content_y = area.y + 1;
                                 let content_bottom = area.y + area.height.saturating_sub(1);
                                 if mouse.column >= area.x
@@ -929,17 +870,100 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                     && mouse.row >= content_y
                                     && mouse.row < content_bottom
                                 {
-                                    let scroll_offset = app.file_list_state.offset();
+                                    let scroll_offset = app.list_state.offset();
+                                    let row = (mouse.row - content_y) as usize + scroll_offset;
+                                    if row < app.tree_items.len()
+                                        && matches!(
+                                            app.tree_items[row],
+                                            TreeItem::Feature { .. } | TreeItem::SubFeature { .. }
+                                        )
+                                    {
+                                        app.hovered_item = Some(row);
+                                    }
+                                }
+                            }
+
+                            if app.hovered_item.is_none() {
+                                if let Some(area) = map_area {
+                                    if mouse.column >= area.x
+                                        && mouse.column < area.x + area.width
+                                        && mouse.row >= area.y
+                                        && mouse.row < area.y + area.height
+                                    {
+                                        let bounds = app.get_bounds();
+                                        let rel_x = f64::from(mouse.column - area.x)
+                                            / f64::from(area.width);
+                                        let rel_y =
+                                            f64::from(mouse.row - area.y) / f64::from(area.height);
+
+                                        let canvas_x = bounds.0 + rel_x * (bounds.2 - bounds.0);
+                                        let canvas_y = bounds.3 - rel_y * (bounds.3 - bounds.1);
+
+                                        app.find_hovered_feature(canvas_x, canvas_y, bounds);
+                                    }
+                                }
+                            }
+                        }
+
+                        if app.hovered_item != prev_hovered {
+                            app.invalidate();
+                        }
+                    }
+                    MouseEventKind::ScrollUp => {
+                        let step = app.scroll_step();
+                        app.move_up_by(step);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let step = app.scroll_step();
+                        app.move_down_by(step);
+                    }
+                    MouseEventKind::Down(_button) => {
+                        if app.mode == ViewMode::FileBrowser {
+                            let area = terminal.get_frame().area();
+                            let content_y = area.y + 1;
+                            let content_bottom = area.y + area.height.saturating_sub(1);
+                            if mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= content_y
+                                && mouse.row < content_bottom
+                            {
+                                let scroll_offset = app.file_list_state.offset();
+                                let clicked_row = (mouse.row - content_y) as usize + scroll_offset;
+                                if clicked_row < app.mlt_files.len() {
+                                    let is_double = last_file_click.is_some_and(|(t, row)| {
+                                        row == clicked_row && t.elapsed().as_millis() < 400
+                                    });
+                                    last_file_click = Some((Instant::now(), clicked_row));
+
+                                    app.selected_file_index = clicked_row;
+                                    app.file_list_state.select(Some(clicked_row));
+                                    app.invalidate_bounds();
+
+                                    if is_double {
+                                        app.handle_enter()?;
+                                    }
+                                }
+                            }
+                        } else if app.mode == ViewMode::LayerOverview {
+                            if let Some(area) = tree_area {
+                                let content_y = area.y + 1;
+                                let content_bottom = area.y + area.height.saturating_sub(1);
+                                if mouse.column >= area.x
+                                    && mouse.column < area.x + area.width
+                                    && mouse.row >= content_y
+                                    && mouse.row < content_bottom
+                                {
+                                    let scroll_offset = app.list_state.offset();
                                     let clicked_row =
                                         (mouse.row - content_y) as usize + scroll_offset;
-                                    if clicked_row < app.mlt_files.len() {
-                                        let is_double = last_file_click.is_some_and(|(t, row)| {
+                                    if clicked_row < app.tree_items.len() {
+                                        let is_double = last_tree_click.is_some_and(|(t, row)| {
                                             row == clicked_row && t.elapsed().as_millis() < 400
                                         });
-                                        last_file_click = Some((Instant::now(), clicked_row));
+                                        last_tree_click = Some((Instant::now(), clicked_row));
 
-                                        app.selected_file_index = clicked_row;
-                                        app.file_list_state.select(Some(clicked_row));
+                                        app.selected_index = clicked_row;
+                                        app.list_state.select(Some(clicked_row));
                                         app.invalidate_bounds();
 
                                         if is_double {
@@ -947,54 +971,24 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
-                            } else if app.mode == ViewMode::LayerOverview {
-                                if let Some(area) = tree_area {
-                                    let content_y = area.y + 1;
-                                    let content_bottom = area.y + area.height.saturating_sub(1);
+                            }
+                            if let Some(hovered) = app.hovered_item {
+                                if let Some(area) = map_area {
                                     if mouse.column >= area.x
                                         && mouse.column < area.x + area.width
-                                        && mouse.row >= content_y
-                                        && mouse.row < content_bottom
+                                        && mouse.row >= area.y
+                                        && mouse.row < area.y + area.height
                                     {
-                                        let scroll_offset = app.list_state.offset();
-                                        let clicked_row =
-                                            (mouse.row - content_y) as usize + scroll_offset;
-                                        if clicked_row < app.tree_items.len() {
-                                            let is_double =
-                                                last_tree_click.is_some_and(|(t, row)| {
-                                                    row == clicked_row
-                                                        && t.elapsed().as_millis() < 400
-                                                });
-                                            last_tree_click = Some((Instant::now(), clicked_row));
-
-                                            app.selected_index = clicked_row;
-                                            app.list_state.select(Some(clicked_row));
-                                            app.invalidate_bounds();
-
-                                            if is_double {
-                                                app.handle_enter()?;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(hovered) = app.hovered_item {
-                                    if let Some(area) = map_area {
-                                        if mouse.column >= area.x
-                                            && mouse.column < area.x + area.width
-                                            && mouse.row >= area.y
-                                            && mouse.row < area.y + area.height
-                                        {
-                                            app.selected_index = hovered;
-                                            app.list_state.select(Some(hovered));
-                                            app.invalidate_bounds();
-                                        }
+                                        app.selected_index = hovered;
+                                        app.list_state.select(Some(hovered));
+                                        app.invalidate_bounds();
                                     }
                                 }
                             }
                         }
-                        _ => {}
                     }
-                }
+                    _ => {}
+                },
                 Event::Resize(_, _) => app.invalidate(),
                 _ => {}
             }
@@ -1086,7 +1080,8 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 } => {
                     let geom = app.get_decoded_geometry(*layer_index);
                     let geom_type = geom.and_then(|g| g.vector_types.get(*feature_index).copied());
-                    let type_str = geom_type.map_or_else(|| "Unknown".to_string(), |gt| format!("{gt:?}"));
+                    let type_str =
+                        geom_type.map_or_else(|| "Unknown".to_string(), |gt| format!("{gt:?}"));
                     let color = geom_type.map(get_geometry_type_color);
 
                     let suffix = if let Some(g) = geom {
@@ -1106,7 +1101,10 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         String::new()
                     };
 
-                    (format!("    Feat {feature_index}: {type_str}{suffix}"), color)
+                    (
+                        format!("    Feat {feature_index}: {type_str}{suffix}"),
+                        color,
+                    )
                 }
                 TreeItem::SubFeature {
                     layer_index,
@@ -1129,14 +1127,18 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         Some(GeometryType::MultiLineString | GeometryType::MultiPolygon)
                     ) {
                         geom.map_or(String::new(), |g| {
-                            let (s, e) = get_sub_feature_vertex_range(g, *feature_index, *part_index);
+                            let (s, e) =
+                                get_sub_feature_vertex_range(g, *feature_index, *part_index);
                             format!(" ({}v)", e.saturating_sub(s))
                         })
                     } else {
                         String::new()
                     };
 
-                    (format!("      Part {part_index}: {type_str}{suffix}"), color)
+                    (
+                        format!("      Part {part_index}: {type_str}{suffix}"),
+                        color,
+                    )
                 }
             };
 
@@ -1227,7 +1229,9 @@ fn get_sub_feature_vertex_range(
         GeometryType::MultiPolygon => {
             if let (Some(p), Some(r)) = (&geom.part_offsets, &geom.ring_offsets) {
                 let ring_start = p[abs_part] as usize;
-                let ring_end = p.get(abs_part + 1).map_or(r.len().saturating_sub(1), |&v| v as usize);
+                let ring_end = p
+                    .get(abs_part + 1)
+                    .map_or(r.len().saturating_sub(1), |&v| v as usize);
                 let start_vert = r[ring_start] as usize;
                 let end_vert = r.get(ring_end).map_or(n_verts, |&v| v as usize);
                 (start_vert, end_vert)
@@ -1328,9 +1332,7 @@ fn render_map_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                             TreeItem::AllLayers => true,
                             TreeItem::Layer { index } => *index == layer_idx,
                             TreeItem::Feature { layer_index, .. }
-                            | TreeItem::SubFeature { layer_index, .. } => {
-                                *layer_index == layer_idx
-                            }
+                            | TreeItem::SubFeature { layer_index, .. } => *layer_index == layer_idx,
                         };
 
                         if should_include_layer {
@@ -1552,7 +1554,11 @@ fn draw_geometry(
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, idx) in (g_start..g_end).enumerate() {
                     let part_color = sub_part_color(
-                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                        selected_sub_part,
+                        hovered_sub_part,
+                        feat_idx,
+                        rel_idx,
+                        color,
                     );
                     if let Some([x, y]) = v(idx) {
                         ctx.print(x, y, Span::styled("×", Style::default().fg(part_color)));
@@ -1564,7 +1570,11 @@ fn draw_geometry(
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, part_idx) in (g_start..g_end).enumerate() {
                     let part_color = sub_part_color(
-                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                        selected_sub_part,
+                        hovered_sub_part,
+                        feat_idx,
+                        rel_idx,
+                        color,
                     );
                     let line_start = p[part_idx] as usize;
                     let line_end = p[part_idx + 1] as usize;
@@ -1576,23 +1586,28 @@ fn draw_geometry(
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, poly_idx) in (g_start..g_end).enumerate() {
                     let part_color = sub_part_color(
-                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                        selected_sub_part,
+                        hovered_sub_part,
+                        feat_idx,
+                        rel_idx,
+                        color,
                     );
                     let (rs, re) = (p[poly_idx] as usize, p[poly_idx + 1] as usize);
                     for ring_idx in rs..re {
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
 
-                        let ring_color = if part_color == Color::White || part_color == Color::Yellow {
-                            part_color
-                        } else {
-                            let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
-                            if is_ccw {
-                                Color::Blue // CCW - typically outer ring
+                        let ring_color =
+                            if part_color == Color::White || part_color == Color::Yellow {
+                                part_color
                             } else {
-                                Color::Red // CW - typically hole
-                            }
-                        };
+                                let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
+                                if is_ccw {
+                                    Color::Blue // CCW - typically outer ring
+                                } else {
+                                    Color::Red // CW - typically hole
+                                }
+                            };
 
                         draw_polygon_ring(ctx, ring_start, ring_end, &v, ring_color);
                     }
