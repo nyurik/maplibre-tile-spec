@@ -334,12 +334,28 @@ impl App {
             }) => {
                 let key = (layer_index, feature_index);
                 if self.expanded_features.contains(&key) {
+                    // Collapse the expanded multi-geometry feature
                     self.expanded_features.remove(&key);
                     self.build_tree_items();
                     if self.selected_index >= self.tree_items.len() {
                         self.selected_index = self.tree_items.len().saturating_sub(1);
                     }
                     self.list_state.select(Some(self.selected_index));
+                } else {
+                    // Collapse the parent layer and select it
+                    if layer_index < self.expanded_layers.len() && self.expanded_layers[layer_index]
+                    {
+                        self.expanded_layers[layer_index] = false;
+                        self.build_tree_items();
+                        // Find and select the layer item
+                        for (idx, item) in self.tree_items.iter().enumerate() {
+                            if matches!(item, TreeItem::Layer { index } if *index == layer_index) {
+                                self.selected_index = idx;
+                                break;
+                            }
+                        }
+                        self.list_state.select(Some(self.selected_index));
+                    }
                 }
             }
             Some(TreeItem::SubFeature {
@@ -347,16 +363,19 @@ impl App {
                 feature_index,
                 ..
             }) => {
-                // Collapse the parent feature
+                // Collapse the parent feature and select it
                 let key = (layer_index, feature_index);
-                if self.expanded_features.contains(&key) {
-                    self.expanded_features.remove(&key);
-                    self.build_tree_items();
-                    if self.selected_index >= self.tree_items.len() {
-                        self.selected_index = self.tree_items.len().saturating_sub(1);
+                self.expanded_features.remove(&key);
+                self.build_tree_items();
+                // Find and select the parent feature item
+                for (idx, item) in self.tree_items.iter().enumerate() {
+                    if matches!(item, TreeItem::Feature { layer_index: li, feature_index: fi } if *li == layer_index && *fi == feature_index)
+                    {
+                        self.selected_index = idx;
+                        break;
                     }
-                    self.list_state.select(Some(self.selected_index));
                 }
+                self.list_state.select(Some(self.selected_index));
             }
             _ => {}
         }
@@ -519,6 +538,10 @@ impl App {
                     layer_index,
                     feature_index,
                 } => {
+                    // Skip feature-level hover if this feature is expanded into sub-parts
+                    if self.expanded_features.contains(&(*layer_index, *feature_index)) {
+                        continue;
+                    }
                     let is_visible = match &selected_item {
                         TreeItem::AllLayers => true,
                         TreeItem::Layer { index } => *layer_index == *index,
@@ -550,6 +573,11 @@ impl App {
                         TreeItem::Feature {
                             layer_index: sel_li,
                             feature_index: sel_fi,
+                        }
+                        | TreeItem::SubFeature {
+                            layer_index: sel_li,
+                            feature_index: sel_fi,
+                            ..
                         } => *layer_index == *sel_li && *feature_index == *sel_fi,
                         _ => false,
                     };
@@ -658,10 +686,10 @@ impl App {
                         TreeItem::SubFeature {
                             layer_index,
                             feature_index,
-                            part_index,
+                            ..
                         } if *layer_index == layer_idx => {
-                            let (start, end) =
-                                get_sub_feature_vertex_range(geom, *feature_index, *part_index);
+                            // Show the whole parent feature's bounds
+                            let (start, end) = get_feature_vertex_range(geom, *feature_index);
                             update(verts, start, end);
                         }
                         _ => {}
@@ -886,11 +914,11 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                     layer_index,
                                     feature_index,
                                 }) => !app.expanded_features.contains(&(*layer_index, *feature_index)),
-                                Some(TreeItem::SubFeature { .. }) => true,
+                                Some(TreeItem::SubFeature { .. }) => false,
                                 _ => false,
                             };
 
-                            if app.mode == ViewMode::LayerOverview && !single_feature {
+                            if app.mode == ViewMode::LayerOverview && !hover_disabled {
                                 // Check if mouse is over the tree panel
                                 if let Some(area) = tree_area {
                                     let content_y = area.y + 1;
@@ -1418,6 +1446,29 @@ fn get_geometry_type_color(geom_type: GeometryType) -> Color {
     }
 }
 
+/// Determine the color for a sub-part of a multi-geometry.
+/// Selected sub-part gets Yellow, hovered gets White, others get DarkGray when
+/// a sub-part is selected/hovered, or the base color otherwise.
+fn sub_part_color(
+    selected: Option<(usize, usize)>,
+    hovered: Option<(usize, usize)>,
+    feat_idx: usize,
+    rel_idx: usize,
+    base_color: Color,
+) -> Color {
+    if selected.is_some_and(|(fi, pi)| fi == feat_idx && pi == rel_idx) {
+        Color::Yellow
+    } else if hovered.is_some_and(|(fi, pi)| fi == feat_idx && pi == rel_idx) {
+        Color::White
+    } else if selected.is_some_and(|(fi, _)| fi == feat_idx)
+        || hovered.is_some_and(|(fi, _)| fi == feat_idx)
+    {
+        Color::DarkGray
+    } else {
+        base_color
+    }
+}
+
 /// Calculate winding order of a polygon ring
 /// Returns true for counter-clockwise (CCW), false for clockwise (CW)
 fn calculate_winding_order<F>(start: usize, end: usize, v: &F) -> bool
@@ -1467,6 +1518,16 @@ fn draw_geometry(
         _ => None,
     };
 
+    // Determine which sub-part is hovered (if any)
+    let hovered_sub_part = hovered_item.and_then(|&h_idx| match &tree_items[h_idx] {
+        TreeItem::SubFeature {
+            layer_index,
+            feature_index,
+            part_index,
+        } if *layer_index == layer_idx => Some((*feature_index, *part_index)),
+        _ => None,
+    });
+
     for (feat_idx, geom_type) in geom.vector_types.iter().enumerate() {
         let should_include_feature = match selected_item {
             TreeItem::AllLayers | TreeItem::Layer { .. } => true,
@@ -1485,20 +1546,12 @@ fn draw_geometry(
             continue;
         }
 
-        // Check if this feature or a sub-feature is hovered
+        // Check if the whole feature is hovered (not a sub-part)
         let is_hovered = hovered_item.is_some_and(|&h_idx| {
-            match &tree_items[h_idx] {
-                TreeItem::Feature {
-                    layer_index,
-                    feature_index,
-                } => *layer_index == layer_idx && *feature_index == feat_idx,
-                TreeItem::SubFeature {
-                    layer_index,
-                    feature_index,
-                    ..
-                } => *layer_index == layer_idx && *feature_index == feat_idx,
-                _ => false,
-            }
+            matches!(&tree_items[h_idx], TreeItem::Feature {
+                layer_index,
+                feature_index,
+            } if *layer_index == layer_idx && *feature_index == feat_idx)
         });
 
         // Determine color based on hover state and geometry type
@@ -1581,11 +1634,11 @@ fn draw_geometry(
                 let g_start = g[feat_idx] as usize;
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, idx) in (g_start..g_end).enumerate() {
-                    if selected_sub_part.is_some_and(|(fi, pi)| fi == feat_idx && pi != rel_idx) {
-                        continue;
-                    }
+                    let part_color = sub_part_color(
+                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                    );
                     if let Some([x, y]) = v(idx) {
-                        ctx.print(x, y, Span::styled("×", Style::default().fg(color)));
+                        ctx.print(x, y, Span::styled("×", Style::default().fg(part_color)));
                     }
                 }
             }
@@ -1593,28 +1646,28 @@ fn draw_geometry(
                 let g_start = g[feat_idx] as usize;
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, part_idx) in (g_start..g_end).enumerate() {
-                    if selected_sub_part.is_some_and(|(fi, pi)| fi == feat_idx && pi != rel_idx) {
-                        continue;
-                    }
+                    let part_color = sub_part_color(
+                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                    );
                     let line_start = p[part_idx] as usize;
                     let line_end = p[part_idx + 1] as usize;
-                    draw_line_string(ctx, line_start, line_end, &v, color);
+                    draw_line_string(ctx, line_start, line_end, &v, part_color);
                 }
             }
             (GeometryType::MultiPolygon, Some(g), Some(p), Some(r)) => {
                 let g_start = g[feat_idx] as usize;
                 let g_end = g[feat_idx + 1] as usize;
                 for (rel_idx, poly_idx) in (g_start..g_end).enumerate() {
-                    if selected_sub_part.is_some_and(|(fi, pi)| fi == feat_idx && pi != rel_idx) {
-                        continue;
-                    }
+                    let part_color = sub_part_color(
+                        selected_sub_part, hovered_sub_part, feat_idx, rel_idx, color,
+                    );
                     let (rs, re) = (p[poly_idx] as usize, p[poly_idx + 1] as usize);
                     for ring_idx in rs..re {
                         let ring_start = r[ring_idx] as usize;
                         let ring_end = r[ring_idx + 1] as usize;
 
-                        let ring_color = if is_hovered {
-                            color
+                        let ring_color = if part_color == Color::White || part_color == Color::Yellow {
+                            part_color
                         } else {
                             let is_ccw = calculate_winding_order(ring_start, ring_end, &v);
                             if is_ccw {
