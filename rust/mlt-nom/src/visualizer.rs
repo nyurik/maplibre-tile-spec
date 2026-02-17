@@ -5,7 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -226,6 +227,64 @@ impl App {
         Ok(())
     }
 
+    /// Expand the current layer's features (if on a Layer item)
+    fn handle_plus(&mut self) {
+        if self.mode != ViewMode::LayerOverview {
+            return;
+        }
+        let layer_index = match self.tree_items.get(self.selected_index) {
+            Some(TreeItem::Layer { index }) => Some(*index),
+            Some(TreeItem::Feature { layer_index, .. }) => Some(*layer_index),
+            _ => None,
+        };
+        if let Some(idx) = layer_index {
+            if idx < self.expanded_layers.len() && !self.expanded_layers[idx] {
+                self.expanded_layers[idx] = true;
+                self.build_tree_items();
+            }
+        }
+    }
+
+    /// Collapse the current layer's features (if on a Layer or Feature item)
+    fn handle_minus(&mut self) {
+        if self.mode != ViewMode::LayerOverview {
+            return;
+        }
+        let layer_index = match self.tree_items.get(self.selected_index) {
+            Some(TreeItem::Layer { index }) => Some(*index),
+            Some(TreeItem::Feature { layer_index, .. }) => Some(*layer_index),
+            _ => None,
+        };
+        if let Some(idx) = layer_index {
+            if idx < self.expanded_layers.len() && self.expanded_layers[idx] {
+                self.expanded_layers[idx] = false;
+                self.build_tree_items();
+                // Move selection to the layer item since features are gone
+                if self.selected_index >= self.tree_items.len() {
+                    self.selected_index = self.tree_items.len().saturating_sub(1);
+                }
+                self.list_state.select(Some(self.selected_index));
+            }
+        }
+    }
+
+    fn handle_star(&mut self) {
+        if self.mode != ViewMode::LayerOverview {
+            return;
+        }
+        // If any layer is collapsed, expand all; otherwise collapse all
+        let new_state = !self.expanded_layers.iter().all(|&e| e);
+        for v in &mut self.expanded_layers {
+            *v = new_state;
+        }
+        self.build_tree_items();
+        // Clamp selected index to remain in range
+        if self.selected_index >= self.tree_items.len() {
+            self.selected_index = self.tree_items.len().saturating_sub(1);
+        }
+        self.list_state.select(Some(self.selected_index));
+    }
+
     fn handle_escape(&mut self) -> bool {
         match self.mode {
             ViewMode::FileBrowser => {
@@ -282,23 +341,7 @@ impl App {
     }
 
     fn handle_right_arrow(&mut self) {
-        if self.mode != ViewMode::LayerOverview {
-            return;
-        }
-
-        if let Some(TreeItem::Feature { layer_index, .. }) =
-            self.tree_items.get(self.selected_index)
-        {
-            // Jump to next layer's name
-            let next_layer_idx = layer_index + 1;
-            for (idx, tree_item) in self.tree_items.iter().enumerate() {
-                if matches!(tree_item, TreeItem::Layer { index } if *index == next_layer_idx) {
-                    self.selected_index = idx;
-                    self.list_state.select(Some(idx));
-                    break;
-                }
-            }
-        }
+        self.handle_plus();
     }
 
     fn handle_page_up(&mut self) {
@@ -324,6 +367,32 @@ impl App {
             ViewMode::LayerOverview => {
                 self.selected_index =
                     (self.selected_index + 10).min(self.tree_items.len().saturating_sub(1));
+                self.list_state.select(Some(self.selected_index));
+            }
+        }
+    }
+
+    fn handle_home(&mut self) {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                self.selected_file_index = 0;
+                self.file_list_state.select(Some(0));
+            }
+            ViewMode::LayerOverview => {
+                self.selected_index = 0;
+                self.list_state.select(Some(0));
+            }
+        }
+    }
+
+    fn handle_end(&mut self) {
+        match self.mode {
+            ViewMode::FileBrowser => {
+                self.selected_file_index = self.mlt_files.len().saturating_sub(1);
+                self.file_list_state.select(Some(self.selected_file_index));
+            }
+            ViewMode::LayerOverview => {
+                self.selected_index = self.tree_items.len().saturating_sub(1);
                 self.list_state.select(Some(self.selected_index));
             }
         }
@@ -594,6 +663,11 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c')
+                        {
+                            break;
+                        }
                         match key.code {
                             KeyCode::Char('q') => break,
                             KeyCode::Esc => {
@@ -604,12 +678,17 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Enter => {
                                 app.handle_enter()?;
                             }
+                            KeyCode::Char('+') | KeyCode::Char('=') => app.handle_plus(),
+                            KeyCode::Char('-') => app.handle_minus(),
+                            KeyCode::Char('*') => app.handle_star(),
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
                             KeyCode::Left => app.handle_left_arrow(),
                             KeyCode::Right => app.handle_right_arrow(),
                             KeyCode::PageUp => app.handle_page_up(),
                             KeyCode::PageDown => app.handle_page_down(),
+                            KeyCode::Home => app.handle_home(),
+                            KeyCode::End => app.handle_end(),
                             _ => {}
                         }
                     }
@@ -786,7 +865,7 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
-            format!("{filename} - Enter to expand/collapse, Esc to go back, q to quit")
+            format!("{filename} - Enter/+/-:expand/collapse, *:toggle all, Esc:back, q:quit")
         }
         ViewMode::FileBrowser => "Layers & Features".to_string(),
     };
