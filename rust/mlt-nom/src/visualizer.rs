@@ -878,11 +878,17 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             app.mouse_pos = Some((mouse.column, mouse.row));
                             app.hovered_item = None;
 
-                            // Disable hover when a single feature or sub-feature is selected
-                            let single_feature = matches!(
-                                app.tree_items.get(app.selected_index),
-                                Some(TreeItem::Feature { .. } | TreeItem::SubFeature { .. })
-                            );
+                            // Disable hover when viewing a single non-expandable item.
+                            // Enable hover when a multi-geometry feature is expanded
+                            // (so sub-parts can be hovered/selected).
+                            let hover_disabled = match app.tree_items.get(app.selected_index) {
+                                Some(TreeItem::Feature {
+                                    layer_index,
+                                    feature_index,
+                                }) => !app.expanded_features.contains(&(*layer_index, *feature_index)),
+                                Some(TreeItem::SubFeature { .. }) => true,
+                                _ => false,
+                            };
 
                             if app.mode == ViewMode::LayerOverview && !single_feature {
                                 // Check if mouse is over the tree panel
@@ -1127,6 +1133,20 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
 
                     let suffix = if n_parts > 0 {
                         format!(" ({n_parts} parts)")
+                    } else if matches!(
+                        geom_type,
+                        Some(GeometryType::LineString | GeometryType::Polygon)
+                    ) {
+                        if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
+                            if let OwnedGeometry::Decoded(geom) = &l.geometry {
+                                let (s, e) = get_feature_vertex_range(geom, *feature_index);
+                                format!(" ({}v)", e.saturating_sub(s))
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
                     } else {
                         String::new()
                     };
