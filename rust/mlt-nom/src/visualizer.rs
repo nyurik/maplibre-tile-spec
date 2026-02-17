@@ -75,6 +75,11 @@ struct App {
     // Scroll acceleration state
     last_scroll_time: Instant,
     scroll_speed: usize,
+    // Rendering optimization
+    needs_redraw: bool,
+    cached_bounds: Option<(f64, f64, f64, f64)>,
+    /// The `selected_index` at the time bounds were cached
+    cached_bounds_key: usize,
 }
 
 impl App {
@@ -98,6 +103,9 @@ impl App {
             expanded_features: HashSet::new(),
             last_scroll_time: Instant::now(),
             scroll_speed: 1,
+            needs_redraw: true,
+            cached_bounds: None,
+            cached_bounds_key: usize::MAX,
         }
     }
 
@@ -129,6 +137,9 @@ impl App {
             expanded_features: HashSet::new(),
             last_scroll_time: Instant::now(),
             scroll_speed: 1,
+            needs_redraw: true,
+            cached_bounds: None,
+            cached_bounds_key: usize::MAX,
         }
     }
 
@@ -157,6 +168,7 @@ impl App {
         self.build_tree_items();
         self.selected_index = 0;
         self.list_state.select(Some(0));
+        self.invalidate_bounds();
 
         Ok(())
     }
@@ -224,12 +236,20 @@ impl App {
     fn move_up_by(&mut self, n: usize) {
         match self.mode {
             ViewMode::FileBrowser => {
+                let prev = self.selected_file_index;
                 self.selected_file_index = self.selected_file_index.saturating_sub(n);
                 self.file_list_state.select(Some(self.selected_file_index));
+                if self.selected_file_index != prev {
+                    self.invalidate_bounds();
+                }
             }
             ViewMode::LayerOverview => {
+                let prev = self.selected_index;
                 self.selected_index = self.selected_index.saturating_sub(n);
                 self.list_state.select(Some(self.selected_index));
+                if self.selected_index != prev {
+                    self.invalidate_bounds();
+                }
             }
         }
     }
@@ -241,14 +261,22 @@ impl App {
     fn move_down_by(&mut self, n: usize) {
         match self.mode {
             ViewMode::FileBrowser => {
+                let prev = self.selected_file_index;
                 let max = self.mlt_files.len().saturating_sub(1);
                 self.selected_file_index = (self.selected_file_index + n).min(max);
                 self.file_list_state.select(Some(self.selected_file_index));
+                if self.selected_file_index != prev {
+                    self.invalidate_bounds();
+                }
             }
             ViewMode::LayerOverview => {
+                let prev = self.selected_index;
                 let max = self.tree_items.len().saturating_sub(1);
                 self.selected_index = (self.selected_index + n).min(max);
                 self.list_state.select(Some(self.selected_index));
+                if self.selected_index != prev {
+                    self.invalidate_bounds();
+                }
             }
         }
     }
@@ -266,6 +294,7 @@ impl App {
                         if *index < self.expanded_layers.len() {
                             self.expanded_layers[*index] = !self.expanded_layers[*index];
                             self.build_tree_items();
+                            self.invalidate();
                         }
                     }
                     Some(TreeItem::Feature {
@@ -280,6 +309,7 @@ impl App {
                                 self.expanded_features.insert(key);
                             }
                             self.build_tree_items();
+                            self.invalidate();
                         }
                     }
                     _ => {}
@@ -309,6 +339,7 @@ impl App {
         self.build_tree_items();
         self.selected_index = self.selected_index.min(self.tree_items.len().saturating_sub(1));
         self.list_state.select(Some(self.selected_index));
+        self.invalidate_bounds();
     }
 
     /// Rebuild tree items and select a specific tree item by predicate.
@@ -318,6 +349,7 @@ impl App {
             self.selected_index = idx;
         }
         self.list_state.select(Some(self.selected_index));
+        self.invalidate_bounds();
     }
 
     /// Expand the current item's children
@@ -331,6 +363,7 @@ impl App {
                 if idx < self.expanded_layers.len() && !self.expanded_layers[idx] {
                     self.expanded_layers[idx] = true;
                     self.build_tree_items();
+                    self.invalidate();
                 }
             }
             Some(TreeItem::Feature {
@@ -343,6 +376,7 @@ impl App {
                 {
                     self.expanded_features.insert(key);
                     self.build_tree_items();
+                    self.invalidate();
                 }
             }
             _ => {}
@@ -403,25 +437,42 @@ impl App {
 
     fn handle_escape(&mut self) -> bool {
         match self.mode {
-            ViewMode::FileBrowser => {
-                true // Exit application
-            }
+            ViewMode::FileBrowser => true,
             ViewMode::LayerOverview => {
                 if self.mlt_files.is_empty() {
-                    true // Exit if no file list
+                    true
                 } else {
                     self.mode = ViewMode::FileBrowser;
                     self.layers.clear();
                     self.tree_items.clear();
                     self.current_file = None;
+                    self.invalidate_bounds();
                     false
                 }
             }
         }
     }
 
+    fn invalidate(&mut self) {
+        self.needs_redraw = true;
+    }
+
+    fn invalidate_bounds(&mut self) {
+        self.cached_bounds = None;
+        self.needs_redraw = true;
+    }
+
     fn get_selected_item(&self) -> &TreeItem {
         &self.tree_items[self.selected_index]
+    }
+
+    /// Return cached bounds, recomputing only when selection changes.
+    fn get_bounds(&mut self) -> (f64, f64, f64, f64) {
+        if self.cached_bounds_key != self.selected_index || self.cached_bounds.is_none() {
+            self.cached_bounds = Some(self.calculate_bounds());
+            self.cached_bounds_key = self.selected_index;
+        }
+        self.cached_bounds.unwrap()
     }
 
     fn handle_left_arrow(&mut self) {
@@ -452,17 +503,21 @@ impl App {
             }
         };
         if let Some(idx) = target {
-            self.selected_index = idx;
-            self.list_state.select(Some(idx));
+            if idx != self.selected_index {
+                self.selected_index = idx;
+                self.list_state.select(Some(idx));
+                self.invalidate_bounds();
+            }
         }
     }
 
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
         let selected_item = self.get_selected_item().clone();
         let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02;
+        let early_exit = threshold * threshold * 0.01; // close enough to stop searching
         let mut best: Option<(usize, f64)> = None;
 
-        for (idx, item) in self.tree_items.iter().enumerate() {
+        'outer: for (idx, item) in self.tree_items.iter().enumerate() {
             let (layer_idx, vert_range) = match item {
                 TreeItem::Feature {
                     layer_index,
@@ -535,6 +590,9 @@ impl App {
                     let dist2 = dx * dx + dy * dy;
                     if best.is_none_or(|(_, d)| dist2 < d) {
                         best = Some((idx, dist2));
+                        if dist2 < early_exit {
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -733,32 +791,30 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_file_click: Option<(Instant, usize)> = None; // (time, row)
 
     loop {
-        terminal.draw(|f| {
-            match app.mode {
-                ViewMode::FileBrowser => {
-                    render_file_browser(f, &mut app);
+        if app.needs_redraw {
+            app.needs_redraw = false;
+            terminal.draw(|f| {
+                match app.mode {
+                    ViewMode::FileBrowser => {
+                        render_file_browser(f, &mut app);
+                    }
+                    ViewMode::LayerOverview => {
+                        let chunks = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+                            .split(f.area());
+
+                        render_tree_panel(f, chunks[0], &mut app);
+                        render_map_panel(f, chunks[1], &app);
+
+                        tree_area = Some(chunks[0]);
+                        map_area = Some(chunks[1]);
+                    }
                 }
-                ViewMode::LayerOverview => {
-                    let chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-                        .split(f.area());
+            })?;
+        }
 
-                    // Render tree panel
-                    render_tree_panel(f, chunks[0], &mut app);
-
-                    // Render map panel
-                    render_map_panel(f, chunks[1], &app);
-
-                    // Store areas for mouse event handling
-                    tree_area = Some(chunks[0]);
-                    map_area = Some(chunks[1]);
-                }
-            }
-        })?;
-
-        // Handle input
-        if event::poll(std::time::Duration::from_millis(100))? {
+        if event::poll(std::time::Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
@@ -795,11 +851,9 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                     match mouse.kind {
                         MouseEventKind::Moved => {
                             app.mouse_pos = Some((mouse.column, mouse.row));
+                            let prev_hovered = app.hovered_item;
                             app.hovered_item = None;
 
-                            // Disable hover when viewing a single non-expandable item.
-                            // Enable hover when a multi-geometry feature is expanded
-                            // (so sub-parts can be hovered/selected).
                             let hover_disabled = matches!(
                                 app.tree_items.get(app.selected_index),
                                 Some(TreeItem::Feature {
@@ -809,7 +863,6 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             if app.mode == ViewMode::LayerOverview && !hover_disabled {
-                                // Check if mouse is over the tree panel
                                 if let Some(area) = tree_area {
                                     let content_y = area.y + 1;
                                     let content_bottom = area.y + area.height.saturating_sub(1);
@@ -832,7 +885,6 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
 
-                                // Check if mouse is over the map panel
                                 if app.hovered_item.is_none() {
                                     if let Some(area) = map_area {
                                         if mouse.column >= area.x
@@ -840,7 +892,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                             && mouse.row >= area.y
                                             && mouse.row < area.y + area.height
                                         {
-                                            let bounds = app.calculate_bounds();
+                                            let bounds = app.get_bounds();
                                             let rel_x = f64::from(mouse.column - area.x)
                                                 / f64::from(area.width);
                                             let rel_y = f64::from(mouse.row - area.y)
@@ -853,6 +905,10 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
+                            }
+
+                            if app.hovered_item != prev_hovered {
+                                app.invalidate();
                             }
                         }
                         MouseEventKind::ScrollUp => {
@@ -884,6 +940,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
 
                                         app.selected_file_index = clicked_row;
                                         app.file_list_state.select(Some(clicked_row));
+                                        app.invalidate_bounds();
 
                                         if is_double {
                                             app.handle_enter()?;
@@ -892,8 +949,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             } else if app.mode == ViewMode::LayerOverview {
                                 if let Some(area) = tree_area {
-                                    // Check click is inside the tree panel content area (inside borders)
-                                    let content_y = area.y + 1; // top border
+                                    let content_y = area.y + 1;
                                     let content_bottom = area.y + area.height.saturating_sub(1);
                                     if mouse.column >= area.x
                                         && mouse.column < area.x + area.width
@@ -904,7 +960,6 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         let clicked_row =
                                             (mouse.row - content_y) as usize + scroll_offset;
                                         if clicked_row < app.tree_items.len() {
-                                            // Detect double-click on same row
                                             let is_double =
                                                 last_tree_click.is_some_and(|(t, row)| {
                                                     row == clicked_row
@@ -914,6 +969,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
 
                                             app.selected_index = clicked_row;
                                             app.list_state.select(Some(clicked_row));
+                                            app.invalidate_bounds();
 
                                             if is_double {
                                                 app.handle_enter()?;
@@ -921,7 +977,6 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
-                                // Click on hovered feature in the map selects it
                                 if let Some(hovered) = app.hovered_item {
                                     if let Some(area) = map_area {
                                         if mouse.column >= area.x
@@ -931,6 +986,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                                         {
                                             app.selected_index = hovered;
                                             app.list_state.select(Some(hovered));
+                                            app.invalidate_bounds();
                                         }
                                     }
                                 }
@@ -939,6 +995,7 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     }
                 }
+                Event::Resize(_, _) => app.invalidate(),
                 _ => {}
             }
         }
