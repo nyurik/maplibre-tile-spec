@@ -289,13 +289,35 @@ impl App {
         Ok(())
     }
 
-    fn is_multi_geometry(&self, layer_index: usize, feature_index: usize) -> bool {
-        if let OwnedLayer::Tag01(l) = &self.layers[layer_index] {
-            if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                return get_multi_part_count(geom, feature_index) > 0;
-            }
+    fn get_decoded_geometry(&self, layer_index: usize) -> Option<&DecodedGeometry> {
+        match self.layers.get(layer_index)? {
+            OwnedLayer::Tag01(l) => match &l.geometry {
+                OwnedGeometry::Decoded(geom) => Some(geom),
+                OwnedGeometry::Raw(_) => None,
+            },
+            OwnedLayer::Unknown(_) => None,
         }
-        false
+    }
+
+    fn is_multi_geometry(&self, layer_index: usize, feature_index: usize) -> bool {
+        self.get_decoded_geometry(layer_index)
+            .is_some_and(|geom| get_multi_part_count(geom, feature_index) > 0)
+    }
+
+    /// Rebuild tree items after expansion state changes, clamping selection.
+    fn rebuild_and_clamp(&mut self) {
+        self.build_tree_items();
+        self.selected_index = self.selected_index.min(self.tree_items.len().saturating_sub(1));
+        self.list_state.select(Some(self.selected_index));
+    }
+
+    /// Rebuild tree items and select a specific tree item by predicate.
+    fn rebuild_and_select(&mut self, pred: impl Fn(&TreeItem) -> bool) {
+        self.build_tree_items();
+        if let Some(idx) = self.tree_items.iter().position(pred) {
+            self.selected_index = idx;
+        }
+        self.list_state.select(Some(self.selected_index));
     }
 
     /// Expand the current item's children
@@ -323,19 +345,11 @@ impl App {
                     self.build_tree_items();
                 }
             }
-            Some(TreeItem::SubFeature { layer_index, .. }) => {
-                // Expand the parent layer if not already
-                let idx = *layer_index;
-                if idx < self.expanded_layers.len() && !self.expanded_layers[idx] {
-                    self.expanded_layers[idx] = true;
-                    self.build_tree_items();
-                }
-            }
             _ => {}
         }
     }
 
-    /// Collapse the current item's children
+    /// Collapse the current item or its parent
     fn handle_minus(&mut self) {
         if self.mode != ViewMode::LayerOverview {
             return;
@@ -344,11 +358,7 @@ impl App {
             Some(TreeItem::Layer { index }) => {
                 if index < self.expanded_layers.len() && self.expanded_layers[index] {
                     self.expanded_layers[index] = false;
-                    self.build_tree_items();
-                    if self.selected_index >= self.tree_items.len() {
-                        self.selected_index = self.tree_items.len().saturating_sub(1);
-                    }
-                    self.list_state.select(Some(self.selected_index));
+                    self.rebuild_and_clamp();
                 }
             }
             Some(TreeItem::Feature {
@@ -356,29 +366,15 @@ impl App {
                 feature_index,
             }) => {
                 let key = (layer_index, feature_index);
-                if self.expanded_features.contains(&key) {
-                    // Collapse the expanded multi-geometry feature
-                    self.expanded_features.remove(&key);
-                    self.build_tree_items();
-                    if self.selected_index >= self.tree_items.len() {
-                        self.selected_index = self.tree_items.len().saturating_sub(1);
-                    }
-                    self.list_state.select(Some(self.selected_index));
-                } else {
-                    // Collapse the parent layer and select it
-                    if layer_index < self.expanded_layers.len() && self.expanded_layers[layer_index]
-                    {
-                        self.expanded_layers[layer_index] = false;
-                        self.build_tree_items();
-                        // Find and select the layer item
-                        for (idx, item) in self.tree_items.iter().enumerate() {
-                            if matches!(item, TreeItem::Layer { index } if *index == layer_index) {
-                                self.selected_index = idx;
-                                break;
-                            }
-                        }
-                        self.list_state.select(Some(self.selected_index));
-                    }
+                if self.expanded_features.remove(&key) {
+                    self.rebuild_and_clamp();
+                } else if layer_index < self.expanded_layers.len()
+                    && self.expanded_layers[layer_index]
+                {
+                    self.expanded_layers[layer_index] = false;
+                    self.rebuild_and_select(|item| {
+                        matches!(item, TreeItem::Layer { index } if *index == layer_index)
+                    });
                 }
             }
             Some(TreeItem::SubFeature {
@@ -386,19 +382,11 @@ impl App {
                 feature_index,
                 ..
             }) => {
-                // Collapse the parent feature and select it
-                let key = (layer_index, feature_index);
-                self.expanded_features.remove(&key);
-                self.build_tree_items();
-                // Find and select the parent feature item
-                for (idx, item) in self.tree_items.iter().enumerate() {
-                    if matches!(item, TreeItem::Feature { layer_index: li, feature_index: fi } if *li == layer_index && *fi == feature_index)
-                    {
-                        self.selected_index = idx;
-                        break;
-                    }
-                }
-                self.list_state.select(Some(self.selected_index));
+                self.expanded_features.remove(&(layer_index, feature_index));
+                self.rebuild_and_select(|item| {
+                    matches!(item, TreeItem::Feature { layer_index: li, feature_index: fi }
+                        if *li == layer_index && *fi == feature_index)
+                });
             }
             _ => {}
         }
@@ -408,17 +396,9 @@ impl App {
         if self.mode != ViewMode::LayerOverview {
             return;
         }
-        // If any layer is collapsed, expand all; otherwise collapse all
         let new_state = !self.expanded_layers.iter().all(|&e| e);
-        for v in &mut self.expanded_layers {
-            *v = new_state;
-        }
-        self.build_tree_items();
-        // Clamp selected index to remain in range
-        if self.selected_index >= self.tree_items.len() {
-            self.selected_index = self.tree_items.len().saturating_sub(1);
-        }
-        self.list_state.select(Some(self.selected_index));
+        self.expanded_layers.fill(new_state);
+        self.rebuild_and_clamp();
     }
 
     fn handle_escape(&mut self) -> bool {
@@ -448,201 +428,113 @@ impl App {
         if self.mode != ViewMode::LayerOverview {
             return;
         }
-
-        if let Some(item) = self.tree_items.get(self.selected_index).cloned() {
-            match item {
-                TreeItem::SubFeature {
-                    layer_index,
-                    feature_index,
-                    ..
-                } => {
-                    // Navigate from sub-feature to its parent feature
-                    for (idx, tree_item) in self.tree_items.iter().enumerate() {
-                        if matches!(tree_item, TreeItem::Feature { layer_index: li, feature_index: fi } if *li == layer_index && *fi == feature_index)
-                        {
-                            self.selected_index = idx;
-                            self.list_state.select(Some(idx));
-                            break;
-                        }
-                    }
+        let Some(item) = self.tree_items.get(self.selected_index).cloned() else {
+            return;
+        };
+        let target = match item {
+            TreeItem::SubFeature {
+                layer_index,
+                feature_index,
+                ..
+            } => self.tree_items.iter().position(|t| {
+                matches!(t, TreeItem::Feature { layer_index: li, feature_index: fi }
+                    if *li == layer_index && *fi == feature_index)
+            }),
+            TreeItem::Feature { layer_index, .. } => self.tree_items.iter().position(|t| {
+                matches!(t, TreeItem::Layer { index } if *index == layer_index)
+            }),
+            TreeItem::Layer { .. } => Some(0),
+            TreeItem::AllLayers => {
+                if !self.mlt_files.is_empty() {
+                    self.mode = ViewMode::FileBrowser;
                 }
-                TreeItem::Feature { layer_index, .. } => {
-                    // Navigate from feature to its layer name
-                    for (idx, tree_item) in self.tree_items.iter().enumerate() {
-                        if matches!(tree_item, TreeItem::Layer { index } if *index == layer_index) {
-                            self.selected_index = idx;
-                            self.list_state.select(Some(idx));
-                            break;
-                        }
-                    }
-                }
-                TreeItem::Layer { .. } => {
-                    // Navigate from layer to "All Layers"
-                    self.selected_index = 0;
-                    self.list_state.select(Some(0));
-                }
-                TreeItem::AllLayers => {
-                    // Navigate to file list if available
-                    if !self.mlt_files.is_empty() {
-                        self.mode = ViewMode::FileBrowser;
-                    }
-                }
+                return;
             }
-        }
-    }
-
-    fn handle_right_arrow(&mut self) {
-        self.handle_plus();
-    }
-
-    fn handle_page_up(&mut self) {
-        match self.mode {
-            ViewMode::FileBrowser => {
-                self.selected_file_index = self.selected_file_index.saturating_sub(10);
-                self.file_list_state.select(Some(self.selected_file_index));
-            }
-            ViewMode::LayerOverview => {
-                self.selected_index = self.selected_index.saturating_sub(10);
-                self.list_state.select(Some(self.selected_index));
-            }
-        }
-    }
-
-    fn handle_page_down(&mut self) {
-        match self.mode {
-            ViewMode::FileBrowser => {
-                self.selected_file_index =
-                    (self.selected_file_index + 10).min(self.mlt_files.len().saturating_sub(1));
-                self.file_list_state.select(Some(self.selected_file_index));
-            }
-            ViewMode::LayerOverview => {
-                self.selected_index =
-                    (self.selected_index + 10).min(self.tree_items.len().saturating_sub(1));
-                self.list_state.select(Some(self.selected_index));
-            }
-        }
-    }
-
-    fn handle_home(&mut self) {
-        match self.mode {
-            ViewMode::FileBrowser => {
-                self.selected_file_index = 0;
-                self.file_list_state.select(Some(0));
-            }
-            ViewMode::LayerOverview => {
-                self.selected_index = 0;
-                self.list_state.select(Some(0));
-            }
-        }
-    }
-
-    fn handle_end(&mut self) {
-        match self.mode {
-            ViewMode::FileBrowser => {
-                self.selected_file_index = self.mlt_files.len().saturating_sub(1);
-                self.file_list_state.select(Some(self.selected_file_index));
-            }
-            ViewMode::LayerOverview => {
-                self.selected_index = self.tree_items.len().saturating_sub(1);
-                self.list_state.select(Some(self.selected_index));
-            }
+        };
+        if let Some(idx) = target {
+            self.selected_index = idx;
+            self.list_state.select(Some(idx));
         }
     }
 
     fn find_hovered_feature(&mut self, canvas_x: f64, canvas_y: f64, bounds: (f64, f64, f64, f64)) {
         let selected_item = self.get_selected_item().clone();
-        let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02; // 2% of view size
-        let mut best: Option<(usize, f64)> = None; // (tree_index, distance²)
+        let threshold = (bounds.2 - bounds.0).max(bounds.3 - bounds.1) * 0.02;
+        let mut best: Option<(usize, f64)> = None;
 
         for (idx, item) in self.tree_items.iter().enumerate() {
-            // Determine the layer index and vertex range for hoverable items
             let (layer_idx, vert_range) = match item {
                 TreeItem::Feature {
                     layer_index,
                     feature_index,
                 } => {
-                    // Skip feature-level hover if this feature is expanded into sub-parts
                     if self.expanded_features.contains(&(*layer_index, *feature_index)) {
                         continue;
                     }
-                    let is_visible = match &selected_item {
+                    let visible = match &selected_item {
                         TreeItem::AllLayers => true,
                         TreeItem::Layer { index } => *layer_index == *index,
                         TreeItem::Feature {
-                            layer_index: sel_layer,
-                            feature_index: sel_feat,
-                        } => *layer_index == *sel_layer && *feature_index == *sel_feat,
+                            layer_index: sl,
+                            feature_index: sf,
+                        } => *layer_index == *sl && *feature_index == *sf,
                         TreeItem::SubFeature { .. } => false,
                     };
-                    if !is_visible {
+                    if !visible {
                         continue;
                     }
-                    if let OwnedLayer::Tag01(l) = &self.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            (*layer_index, get_feature_vertex_range(geom, *feature_index))
-                        } else {
-                            continue;
-                        }
-                    } else {
+                    let Some(geom) = self.get_decoded_geometry(*layer_index) else {
                         continue;
-                    }
+                    };
+                    (*layer_index, get_feature_vertex_range(geom, *feature_index))
                 }
                 TreeItem::SubFeature {
                     layer_index,
                     feature_index,
                     part_index,
                 } => {
-                    let is_visible = match &selected_item {
+                    let visible = match &selected_item {
                         TreeItem::Feature {
-                            layer_index: sel_layer,
-                            feature_index: sel_feat,
+                            layer_index: sl,
+                            feature_index: sf,
                         }
                         | TreeItem::SubFeature {
-                            layer_index: sel_layer,
-                            feature_index: sel_feat,
+                            layer_index: sl,
+                            feature_index: sf,
                             ..
-                        } => *layer_index == *sel_layer && *feature_index == *sel_feat,
+                        } => *layer_index == *sl && *feature_index == *sf,
                         _ => false,
                     };
-                    if !is_visible {
+                    if !visible {
                         continue;
                     }
-                    if let OwnedLayer::Tag01(l) = &self.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            (
-                                *layer_index,
-                                get_sub_feature_vertex_range(geom, *feature_index, *part_index),
-                            )
-                        } else {
-                            continue;
-                        }
-                    } else {
+                    let Some(geom) = self.get_decoded_geometry(*layer_index) else {
                         continue;
-                    }
+                    };
+                    (
+                        *layer_index,
+                        get_sub_feature_vertex_range(geom, *feature_index, *part_index),
+                    )
                 }
                 _ => continue,
             };
 
-            if let OwnedLayer::Tag01(l) = &self.layers[layer_idx] {
-                if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                    let verts = geom.vertices.as_deref().unwrap_or(&[]);
-                    let (start, end) = vert_range;
-                    for vi in start..end {
-                        let i = vi * 2;
-                        if i + 1 >= verts.len() {
-                            break;
-                        }
-                        let x = f64::from(verts[i]);
-                        let y = f64::from(verts[i + 1]);
-                        let dx = (x - canvas_x).abs();
-                        let dy = (y - canvas_y).abs();
-
-                        if dx < threshold && dy < threshold {
-                            let dist2 = dx * dx + dy * dy;
-                            if best.is_none_or(|(_, d)| dist2 < d) {
-                                best = Some((idx, dist2));
-                            }
-                        }
+            let Some(geom) = self.get_decoded_geometry(layer_idx) else {
+                continue;
+            };
+            let verts = geom.vertices.as_deref().unwrap_or(&[]);
+            let (start, end) = vert_range;
+            for vi in start..end {
+                let i = vi * 2;
+                if i + 1 >= verts.len() {
+                    break;
+                }
+                let dx = (f64::from(verts[i]) - canvas_x).abs();
+                let dy = (f64::from(verts[i + 1]) - canvas_y).abs();
+                if dx < threshold && dy < threshold {
+                    let dist2 = dx * dx + dy * dy;
+                    if best.is_none_or(|(_, d)| dist2 < d) {
+                        best = Some((idx, dist2));
                     }
                 }
             }
@@ -654,12 +546,9 @@ impl App {
     fn get_extent(&self) -> f64 {
         self.layers
             .iter()
-            .find_map(|l| {
-                if let OwnedLayer::Tag01(layer) = l {
-                    Some(f64::from(layer.extent))
-                } else {
-                    None
-                }
+            .find_map(|l| match l {
+                OwnedLayer::Tag01(layer) => Some(f64::from(layer.extent)),
+                OwnedLayer::Unknown(_) => None,
             })
             .unwrap_or(4096.0)
     }
@@ -688,36 +577,31 @@ impl App {
             }
         };
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            if let OwnedLayer::Tag01(l) = layer {
-                if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                    let verts = geom.vertices.as_deref().unwrap_or(&[]);
-                    match selected_item {
-                        TreeItem::AllLayers => {
-                            update(verts, 0, verts.len() / 2);
-                        }
-                        TreeItem::Layer { index } if *index == layer_idx => {
-                            update(verts, 0, verts.len() / 2);
-                        }
-                        TreeItem::Feature {
-                            layer_index,
-                            feature_index,
-                        } if *layer_index == layer_idx => {
-                            let (start, end) = get_feature_vertex_range(geom, *feature_index);
-                            update(verts, start, end);
-                        }
-                        TreeItem::SubFeature {
-                            layer_index,
-                            feature_index,
-                            ..
-                        } if *layer_index == layer_idx => {
-                            // Show the whole parent feature's bounds
-                            let (start, end) = get_feature_vertex_range(geom, *feature_index);
-                            update(verts, start, end);
-                        }
-                        _ => {}
-                    }
+        for (layer_idx, _) in self.layers.iter().enumerate() {
+            let Some(geom) = self.get_decoded_geometry(layer_idx) else {
+                continue;
+            };
+            let verts = geom.vertices.as_deref().unwrap_or(&[]);
+            match selected_item {
+                TreeItem::AllLayers => {
+                    update(verts, 0, verts.len() / 2);
                 }
+                TreeItem::Layer { index } if *index == layer_idx => {
+                    update(verts, 0, verts.len() / 2);
+                }
+                TreeItem::Feature {
+                    layer_index,
+                    feature_index,
+                }
+                | TreeItem::SubFeature {
+                    layer_index,
+                    feature_index,
+                    ..
+                } if *layer_index == layer_idx => {
+                    let (start, end) = get_feature_vertex_range(geom, *feature_index);
+                    update(verts, start, end);
+                }
+                _ => {}
             }
         }
 
@@ -727,7 +611,6 @@ impl App {
         max_x = max_x.max(extent);
         max_y = max_y.max(extent);
 
-        // Add some padding
         let padding_x = (max_x - min_x) * 0.1;
         let padding_y = (max_y - min_y) * 0.1;
 
@@ -740,41 +623,45 @@ impl App {
     }
 }
 
-/// Helper function to convert borrowed layers to owned layers
+/// Convert borrowed layers to owned layers
 fn convert_to_owned_layers(
     layers: &[Layer<'_>],
 ) -> Result<Vec<OwnedLayer>, Box<dyn std::error::Error>> {
-    let mut owned_layers = Vec::new();
-    for layer in layers {
-        if let Layer::Tag01(l) = layer {
-            let owned_layer = mlt_nom::v01::OwnedLayer01 {
-                name: l.name.to_string(),
-                extent: l.extent,
-                id: match &l.id {
-                    mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
-                    mlt_nom::v01::Id::None | mlt_nom::v01::Id::Raw(_) => {
-                        mlt_nom::v01::OwnedId::None
-                    }
-                },
-                geometry: match &l.geometry {
-                    mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
-                    mlt_nom::v01::Geometry::Raw(_) => return Err("Geometry not decoded".into()),
-                },
-                properties: l
-                    .properties
-                    .iter()
-                    .try_fold(Vec::new(), |mut acc, p| match p {
-                        mlt_nom::v01::Property::Decoded(d) => {
-                            acc.push(mlt_nom::v01::OwnedProperty::Decoded(d.clone()));
-                            Ok(acc)
-                        }
-                        mlt_nom::v01::Property::Raw(_) => Err("Property not decoded"),
-                    })?,
-            };
-            owned_layers.push(OwnedLayer::Tag01(owned_layer));
-        }
-    }
-    Ok(owned_layers)
+    layers
+        .iter()
+        .filter_map(|layer| match layer {
+            Layer::Tag01(l) => Some(convert_layer01(l)),
+            Layer::Unknown(_) => None,
+        })
+        .collect()
+}
+
+fn convert_layer01(
+    l: &mlt_nom::v01::Layer01<'_>,
+) -> Result<OwnedLayer, Box<dyn std::error::Error>> {
+    let properties = l
+        .properties
+        .iter()
+        .map(|p| match p {
+            mlt_nom::v01::Property::Decoded(d) => {
+                Ok(mlt_nom::v01::OwnedProperty::Decoded(d.clone()))
+            }
+            mlt_nom::v01::Property::Raw(_) => Err("Property not decoded".into()),
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+    Ok(OwnedLayer::Tag01(mlt_nom::v01::OwnedLayer01 {
+        name: l.name.to_string(),
+        extent: l.extent,
+        id: match &l.id {
+            mlt_nom::v01::Id::Decoded(d) => mlt_nom::v01::OwnedId::Decoded(d.clone()),
+            mlt_nom::v01::Id::None | mlt_nom::v01::Id::Raw(_) => mlt_nom::v01::OwnedId::None,
+        },
+        geometry: match &l.geometry {
+            mlt_nom::v01::Geometry::Decoded(g) => OwnedGeometry::Decoded(g.clone()),
+            mlt_nom::v01::Geometry::Raw(_) => return Err("Geometry not decoded".into()),
+        },
+        properties,
+    }))
 }
 
 /// Recursively find all .mlt files in a directory
@@ -829,24 +716,6 @@ pub fn run_with_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err("Path is not a file or directory".into())
     }
-}
-
-/// Run the TUI application (deprecated - use `run_with_path` instead)
-#[deprecated(note = "Use run_with_path instead")]
-#[allow(dead_code)]
-pub fn run(layers: &[Layer<'_>]) -> Result<(), Box<dyn std::error::Error>> {
-    // Convert borrowed layers to owned by parsing again from owned data
-    // This is a workaround since borrowme doesn't provide a direct conversion
-    let owned_layers = Vec::new();
-    if !layers.is_empty() {
-        // We can't easily convert Layer<'a> to OwnedLayer without re-encoding
-        // For now, just return an error
-        return Err("Direct layer conversion not supported. Use run_with_path instead.".into());
-    }
-
-    let mut app = App::new_single_file(owned_layers, None);
-    app.build_tree_items();
-    run_app(app)
 }
 
 /// Main application loop
@@ -908,17 +777,16 @@ fn run_app(mut app: App) -> Result<(), Box<dyn std::error::Error>> {
                             KeyCode::Enter => {
                                 app.handle_enter()?;
                             }
-                            KeyCode::Char('+' | '=') => app.handle_plus(),
+                            KeyCode::Char('+' | '=') | KeyCode::Right => app.handle_plus(),
                             KeyCode::Char('-') => app.handle_minus(),
                             KeyCode::Char('*') => app.handle_star(),
                             KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
                             KeyCode::Left => app.handle_left_arrow(),
-                            KeyCode::Right => app.handle_right_arrow(),
-                            KeyCode::PageUp => app.handle_page_up(),
-                            KeyCode::PageDown => app.handle_page_down(),
-                            KeyCode::Home => app.handle_home(),
-                            KeyCode::End => app.handle_end(),
+                            KeyCode::PageUp => app.move_up_by(10),
+                            KeyCode::PageDown => app.move_down_by(10),
+                            KeyCode::Home => app.move_up_by(usize::MAX),
+                            KeyCode::End => app.move_down_by(usize::MAX),
                             _ => {}
                         }
                     }
@@ -1159,47 +1027,21 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                     layer_index,
                     feature_index,
                 } => {
-                    let geom_type = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            geom.vector_types.get(*feature_index).copied()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let type_str = if let Some(gt) = geom_type {
-                        format!("{gt:?}")
-                    } else {
-                        "Unknown".to_string()
-                    };
-
+                    let geom = app.get_decoded_geometry(*layer_index);
+                    let geom_type = geom.and_then(|g| g.vector_types.get(*feature_index).copied());
+                    let type_str = geom_type.map_or_else(|| "Unknown".to_string(), |gt| format!("{gt:?}"));
                     let color = geom_type.map(get_geometry_type_color);
 
-                    let n_parts = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            get_multi_part_count(geom, *feature_index)
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-
-                    let suffix = if n_parts > 0 {
-                        format!(" ({n_parts} parts)")
-                    } else if matches!(
-                        geom_type,
-                        Some(GeometryType::LineString | GeometryType::Polygon)
-                    ) {
-                        if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                            if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                                let (s, e) = get_feature_vertex_range(geom, *feature_index);
-                                format!(" ({}v)", e.saturating_sub(s))
-                            } else {
-                                String::new()
-                            }
+                    let suffix = if let Some(g) = geom {
+                        let n_parts = get_multi_part_count(g, *feature_index);
+                        if n_parts > 0 {
+                            format!(" ({n_parts} parts)")
+                        } else if matches!(
+                            geom_type,
+                            Some(GeometryType::LineString | GeometryType::Polygon)
+                        ) {
+                            let (s, e) = get_feature_vertex_range(g, *feature_index);
+                            format!(" ({}v)", e.saturating_sub(s))
                         } else {
                             String::new()
                         }
@@ -1207,65 +1049,37 @@ fn render_tree_panel(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
                         String::new()
                     };
 
-                    (
-                        format!("    Feat {feature_index}: {type_str}{suffix}"),
-                        color,
-                    )
+                    (format!("    Feat {feature_index}: {type_str}{suffix}"), color)
                 }
                 TreeItem::SubFeature {
                     layer_index,
                     feature_index,
                     part_index,
                 } => {
-                    let (sub_type, suffix) =
-                        if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                            if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                                let gt = geom.vector_types.get(*feature_index);
-                                let name = gt.map(|g| match g {
-                                    GeometryType::MultiPoint => "Point",
-                                    GeometryType::MultiLineString => "LineString",
-                                    GeometryType::MultiPolygon => "Polygon",
-                                    _ => "Part",
-                                });
-                                let sz = if matches!(
-                                    gt,
-                                    Some(
-                                        GeometryType::MultiLineString | GeometryType::MultiPolygon
-                                    )
-                                ) {
-                                    let (s, e) = get_sub_feature_vertex_range(
-                                        geom,
-                                        *feature_index,
-                                        *part_index,
-                                    );
-                                    format!(" ({}v)", e.saturating_sub(s))
-                                } else {
-                                    String::new()
-                                };
-                                (name, sz)
-                            } else {
-                                (None, String::new())
-                            }
-                        } else {
-                            (None, String::new())
-                        };
-                    let type_str = sub_type.unwrap_or("Part");
-                    let color = if let OwnedLayer::Tag01(l) = &app.layers[*layer_index] {
-                        if let OwnedGeometry::Decoded(geom) = &l.geometry {
-                            geom.vector_types
-                                .get(*feature_index)
-                                .copied()
-                                .map(get_geometry_type_color)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
+                    let geom = app.get_decoded_geometry(*layer_index);
+                    let geom_type = geom.and_then(|g| g.vector_types.get(*feature_index).copied());
+                    let color = geom_type.map(get_geometry_type_color);
+
+                    let type_str = match geom_type {
+                        Some(GeometryType::MultiPoint) => "Point",
+                        Some(GeometryType::MultiLineString) => "LineString",
+                        Some(GeometryType::MultiPolygon) => "Polygon",
+                        _ => "Part",
                     };
-                    (
-                        format!("      Part {part_index}: {type_str}{suffix}"),
-                        color,
-                    )
+
+                    let suffix = if matches!(
+                        geom_type,
+                        Some(GeometryType::MultiLineString | GeometryType::MultiPolygon)
+                    ) {
+                        geom.map_or(String::new(), |g| {
+                            let (s, e) = get_sub_feature_vertex_range(g, *feature_index, *part_index);
+                            format!(" ({}v)", e.saturating_sub(s))
+                        })
+                    } else {
+                        String::new()
+                    };
+
+                    (format!("      Part {part_index}: {type_str}{suffix}"), color)
                 }
             };
 
@@ -1763,19 +1577,7 @@ fn draw_polygon_ring<F>(
 ) where
     F: Fn(usize) -> Option<[f64; 2]>,
 {
-    // Draw edges
-    for i in start..end.saturating_sub(1) {
-        if let (Some([x1, y1]), Some([x2, y2])) = (v(i), v(i + 1)) {
-            ctx.draw(&ratatui::widgets::canvas::Line {
-                x1,
-                y1,
-                x2,
-                y2,
-                color,
-            });
-        }
-    }
-    // Close the ring
+    draw_line_string(ctx, start, end, v, color);
     if end > start {
         if let (Some([x1, y1]), Some([x2, y2])) = (v(end - 1), v(start)) {
             ctx.draw(&ratatui::widgets::canvas::Line {
