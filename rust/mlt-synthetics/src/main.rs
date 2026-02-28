@@ -4,7 +4,6 @@
 //! The goal is to produce byte-for-byte identical output to the Java generator.
 
 mod layer;
-
 use std::fs;
 use std::path::Path;
 
@@ -17,7 +16,7 @@ use mlt_core::v01::{
     PresenceStream as O, PropValue, PropertyEncoder,
 };
 
-use crate::layer::{DecodedProp, bool, geo_fastpfor, geo_varint, geo_varint_auto_rle, i32};
+use crate::layer::{DecodedProp, SynthWriter, bool, i32};
 
 // Coordinate constants matching Java SyntheticMltUtil.java
 // Using SRID=0 tile space; Use tiny tile extent 80 for most geometry tests.
@@ -53,11 +52,12 @@ fn main() {
         .unwrap_or_else(|_| panic!("bad path {}", dir.display()));
     println!("Generating synthetic test data in {}", dir.display());
 
-    generate_geometry(&dir);
-    generate_mixed(&dir);
-    generate_extent(&dir);
-    generate_ids(&dir);
-    generate_properties(&dir);
+    let writer = SynthWriter::new(dir);
+    generate_geometry(&writer);
+    generate_mixed(&writer);
+    generate_extent(&writer);
+    generate_ids(&writer);
+    generate_properties(&writer);
 }
 
 // Geometry builder macros matching Java definitions
@@ -77,45 +77,45 @@ fn poly1h() -> geo_types::Polygon<i32> {
     polygon! { exterior: [C1, C2, C3, C1], interiors: [[H1, H2, H3, H1]] }
 }
 
-fn generate_geometry(d: &Path) {
-    geo_varint().geo(P0).write(d, "point");
-    geo_varint().geo(line1()).write(d, "line");
-    geo_varint().geo(poly1()).write(d, "polygon");
-    geo_fastpfor().geo(poly1()).write(d, "polygon_fpf");
-    geo_varint().tessellated(poly1()).write(d, "polygon_tes");
-    geo_fastpfor()
+fn generate_geometry(w: &SynthWriter) {
+    w.geo_varint().geo(P0).write("point");
+    w.geo_varint().geo(line1()).write("line");
+    w.geo_varint().geo(poly1()).write("polygon");
+    w.geo_fastpfor().geo(poly1()).write("polygon_fpf");
+    w.geo_varint().tessellated(poly1()).write("polygon_tes");
+    w.geo_fastpfor()
         .tessellated(poly1())
-        .write(d, "polygon_fpf_tes");
-    geo_varint()
+        .write("polygon_fpf_tes");
+    w.geo_varint()
         .parts_ring(E::rle_varint())
         .geo(poly1h())
-        .write(d, "polygon_hole");
-    geo_fastpfor()
+        .write("polygon_hole");
+    w.geo_fastpfor()
         .parts_ring(E::rle_fastpfor())
         .geo(poly1h())
-        .write(d, "polygon_hole_fpf");
-    geo_varint()
+        .write("polygon_hole_fpf");
+    w.geo_varint()
         .rings(E::rle_varint())
         .rings2(E::rle_varint())
         .geo(MultiPolygon(vec![poly1(), poly2()]))
-        .write(d, "polygon_multi");
-    geo_fastpfor()
+        .write("polygon_multi");
+    w.geo_fastpfor()
         .rings(E::rle_fastpfor())
         .rings2(E::rle_fastpfor())
         .geo(MultiPolygon(vec![poly1(), poly2()]))
-        .write(d, "polygon_multi_fpf");
-    geo_varint()
+        .write("polygon_multi_fpf");
+    w.geo_varint()
         .geo(MultiPoint(vec![P1, P2, P3]))
-        .write(d, "multipoint");
-    geo_varint()
+        .write("multipoint");
+    w.geo_varint()
         .no_rings(E::rle_varint())
         .geo(MultiLineString(vec![line1(), line2()]))
-        .write(d, "multiline");
+        .write("multiline");
 }
 
 /// Generate all k-combinations of geometry types
 fn generate_mixed_combine<'a>(
-    d: &Path,
+    w: &SynthWriter,
     types: &[(&'a str, Geom32)],
     k: usize,
     start: usize,
@@ -137,24 +137,24 @@ fn generate_mixed_combine<'a>(
         }
         // Collect geometries for auto-RLE detection
         let geoms: Vec<Geom32> = current.iter().map(|(_, g)| g.clone()).collect();
-        let mut layer = geo_varint_auto_rle(&geoms);
+        let mut layer = w.geo_varint_auto_rle(&geoms);
         for geo in geoms {
             layer = layer.geo(geo);
         }
-        layer.write(d, &name);
+        layer.write(&name);
     } else {
         for i in start..types.len() {
             if i > start && types[i].0 == types[i - 1].0 {
                 continue;
             }
             current.push(types[i].clone());
-            generate_mixed_combine(d, types, k, i + 1, current, skip);
+            generate_mixed_combine(w, types, k, i + 1, current, skip);
             current.pop();
         }
     }
 }
 
-fn generate_mixed(d: &Path) {
+fn generate_mixed(w: &SynthWriter) {
     // Coordinates matching Java SyntheticMltGenerator.generateMixed()
     let c = |x, y| coord! { x: x, y: y };
 
@@ -204,7 +204,7 @@ fn generate_mixed(d: &Path) {
 
     // Generate all k-combinations for k = 2 to 7
     for k in 2..=types.len() {
-        generate_mixed_combine(d, &types, k, 0, &mut vec![], &skip);
+        generate_mixed_combine(w, &types, k, 0, &mut vec![], &skip);
     }
 
     // Generate A-A (duplicate) and A-B-A patterns
@@ -212,123 +212,123 @@ fn generate_mixed(d: &Path) {
         // A-A variant: mix_dup_<a>
         let name = format!("mix_dup_{na}");
         let geoms = vec![ga.clone(), ga.clone()];
-        let mut layer = geo_varint_auto_rle(&geoms);
+        let mut layer = w.geo_varint_auto_rle(&geoms);
         for g in geoms {
             layer = layer.geo(g);
         }
-        layer.write(d, &name);
+        layer.write(&name);
 
         for (nb, gb) in &types {
             if na != nb {
                 // A-B-A variant: mix_<a>_<b>_<a>
                 let name = format!("mix_{na}_{nb}_{na}");
                 let geoms = vec![ga.clone(), gb.clone(), ga.clone()];
-                let mut layer = geo_varint_auto_rle(&geoms);
+                let mut layer = w.geo_varint_auto_rle(&geoms);
                 for g in geoms {
                     layer = layer.geo(g);
                 }
-                layer.write(d, &name);
+                layer.write(&name);
             }
         }
     }
 }
 
-fn generate_extent(d: &Path) {
-    geo_varint()
+fn generate_extent(w: &SynthWriter) {
+    w.geo_varint()
         .extent(512)
         .geo(line_string![
             coord! { x: 0, y: 0 },
             coord! { x: 511, y: 511 }
         ])
-        .write(d, "extent_512");
-    geo_varint()
+        .write("extent_512");
+    w.geo_varint()
         .extent(512)
         .geo(line_string![
             coord! { x: -42, y: -42 },
             coord! { x: 554, y: 554 }
         ])
-        .write(d, "extent_buf_512");
-    geo_varint()
+        .write("extent_buf_512");
+    w.geo_varint()
         .extent(4096)
         .geo(line_string![
             coord! { x: 0, y: 0 },
             coord! { x: 4095, y: 4095 }
         ])
-        .write(d, "extent_4096");
-    geo_varint()
+        .write("extent_4096");
+    w.geo_varint()
         .extent(4096)
         .geo(line_string![
             coord! { x: -42, y: -42 },
             coord! { x: 4138, y: 4138 }
         ])
-        .write(d, "extent_buf_4096");
-    geo_varint()
+        .write("extent_buf_4096");
+    w.geo_varint()
         .extent(131_072)
         .geo(line_string![
             coord! { x: 0, y: 0 },
             coord! { x: 131_071, y: 131_071 },
         ])
-        .write(d, "extent_131072");
-    geo_varint()
+        .write("extent_131072");
+    w.geo_varint()
         .extent(131_072)
         .geo(line_string![
             coord! { x: -42, y: -42 },
             coord! { x: 131_114, y: 131_114 },
         ])
-        .write(d, "extent_buf_131072");
-    geo_varint()
+        .write("extent_buf_131072");
+    w.geo_varint()
         .extent(1_073_741_824)
         .geo(line_string![
             coord! { x: 0, y: 0 },
             coord! { x: 1_073_741_823, y: 1_073_741_823 },
         ])
-        .write(d, "extent_1073741824");
-    geo_varint()
+        .write("extent_1073741824");
+    w.geo_varint()
         .extent(1_073_741_824)
         .geo(line_string![
             coord! { x: -42, y: -42 },
             coord! { x: 1_073_741_866, y: 1_073_741_866 },
         ])
-        .write(d, "extent_buf_1073741824");
+        .write("extent_buf_1073741824");
 }
 
-fn generate_ids(d: &Path) {
-    let p0 = || geo_varint().geo(P0);
+fn generate_ids(w: &SynthWriter) {
+    let p0 = || w.geo_varint().geo(P0);
     p0().ids(vec![Some(0)], IdEncoder::new(L::None, IdWidth::Id32))
-        .write(d, "id0");
+        .write("id0");
     p0().ids(vec![Some(100)], IdEncoder::new(L::None, IdWidth::Id32))
-        .write(d, "id");
+        .write("id");
     p0().ids(
         vec![Some(9_234_567_890)],
         IdEncoder::new(L::None, IdWidth::Id64),
     )
-    .write(d, "id64");
+    .write("id64");
 
-    let four_p0 = || geo_varint().meta(E::rle_varint()).geos([P0, P0, P0, P0]);
+    let four_p0 = || w.geo_varint().meta(E::rle_varint()).geos([P0, P0, P0, P0]);
     four_p0()
         .ids(
             vec![Some(103), Some(103), Some(103), Some(103)],
             IdEncoder::new(L::None, IdWidth::Id32),
         )
-        .write(d, "ids");
+        .write("ids");
     four_p0()
         .ids(
             vec![Some(103), Some(103), Some(103), Some(103)],
             IdEncoder::new(L::Delta, IdWidth::Id32),
         )
-        .write(d, "ids_delta");
+        .write("ids_delta");
     four_p0()
         .ids(
             vec![Some(103), Some(103), Some(103), Some(103)],
             IdEncoder::new(L::Rle, IdWidth::Id32),
         )
-        .write(d, "ids_rle");
+        .write("ids_rle");
     four_p0()
         .ids(
             vec![Some(103), Some(103), Some(103), Some(103)],
             IdEncoder::new(L::DeltaRle, IdWidth::Id32),
         )
-        .write(d, "ids_delta_rle");
+        .write("ids_delta_rle");
     four_p0()
         .ids(
             vec![
@@ -339,7 +339,7 @@ fn generate_ids(d: &Path) {
             ],
             IdEncoder::new(L::None, IdWidth::Id64),
         )
-        .write(d, "ids64");
+        .write("ids64");
     four_p0()
         .ids(
             vec![
@@ -350,7 +350,7 @@ fn generate_ids(d: &Path) {
             ],
             IdEncoder::new(L::Delta, IdWidth::Id64),
         )
-        .write(d, "ids64_delta");
+        .write("ids64_delta");
     four_p0()
         .ids(
             vec![
@@ -361,7 +361,7 @@ fn generate_ids(d: &Path) {
             ],
             IdEncoder::new(L::Rle, IdWidth::Id64),
         )
-        .write(d, "ids64_rle");
+        .write("ids64_rle");
     four_p0()
         .ids(
             vec![
@@ -372,10 +372,10 @@ fn generate_ids(d: &Path) {
             ],
             IdEncoder::new(L::DeltaRle, IdWidth::Id64),
         )
-        .write(d, "ids64_delta_rle");
+        .write("ids64_delta_rle");
 
     let five_p0 = || {
-        geo_varint()
+        w.geo_varint()
             .meta(E::rle_varint())
             .geos([P0, P0, P0, P0, P0])
     };
@@ -384,45 +384,44 @@ fn generate_ids(d: &Path) {
             vec![Some(100), Some(101), None, Some(105), Some(106)],
             IdEncoder::new(L::None, IdWidth::OptId32),
         )
-        .write(d, "ids_opt");
+        .write("ids_opt");
     five_p0()
         .ids(
             vec![Some(100), Some(101), None, Some(105), Some(106)],
             IdEncoder::new(L::Delta, IdWidth::OptId32),
         )
-        .write(d, "ids_opt_delta");
+        .write("ids_opt_delta");
     five_p0()
         .ids(
             vec![None, Some(9_234_567_890), Some(101), Some(105), Some(106)],
             IdEncoder::new(L::None, IdWidth::OptId64),
         )
-        .write(d, "ids64_opt");
+        .write("ids64_opt");
     five_p0()
         .ids(
             vec![None, Some(9_234_567_890), Some(101), Some(105), Some(106)],
             IdEncoder::new(L::Delta, IdWidth::OptId64),
         )
-        .write(d, "ids64_opt_delta");
+        .write("ids64_opt_delta");
 }
 
-fn generate_properties(d: &Path) {
-    let p0 = || geo_varint().geo(P0);
+fn generate_properties(w: &SynthWriter) {
+    let p0 = || w.geo_varint().geo(P0);
     let enc = PropertyEncoder::new(O::Present, L::None, P::VarInt);
 
     // Boolean properties
-    p0().add_prop(bool("val", enc).add(true))
-        .write(d, "prop_bool");
+    p0().add_prop(bool("val", enc).add(true)).write("prop_bool");
     p0().add_prop(bool("val", enc).add(false))
-        .write(d, "prop_bool_false");
+        .write("prop_bool_false");
 
     // i32 properties
-    p0().add_prop(i32("val", enc).add(42)).write(d, "prop_i32");
+    p0().add_prop(i32("val", enc).add(42)).write("prop_i32");
     p0().add_prop(i32("val", enc).add(-42))
-        .write(d, "prop_i32_neg");
+        .write("prop_i32_neg");
     p0().add_prop(i32("val", enc).add(i32::MIN))
-        .write(d, "prop_i32_min");
+        .write("prop_i32_min");
     p0().add_prop(i32("val", enc).add(i32::MAX))
-        .write(d, "prop_i32_max");
+        .write("prop_i32_max");
 
     // u32 properties
     let u32_prop = |v| {
@@ -434,9 +433,9 @@ fn generate_properties(d: &Path) {
             enc,
         )
     };
-    p0().add_prop(u32_prop(42)).write(d, "prop_u32");
-    p0().add_prop(u32_prop(0)).write(d, "prop_u32_min");
-    p0().add_prop(u32_prop(u32::MAX)).write(d, "prop_u32_max");
+    p0().add_prop(u32_prop(42)).write("prop_u32");
+    p0().add_prop(u32_prop(0)).write("prop_u32_min");
+    p0().add_prop(u32_prop(u32::MAX)).write("prop_u32_max");
 
     // i64 properties
     let i64_prop = |v| {
@@ -448,11 +447,11 @@ fn generate_properties(d: &Path) {
             enc,
         )
     };
-    p0().add_prop(i64_prop(9_876_543_210)).write(d, "prop_i64");
+    p0().add_prop(i64_prop(9_876_543_210)).write("prop_i64");
     p0().add_prop(i64_prop(-9_876_543_210))
-        .write(d, "prop_i64_neg");
-    p0().add_prop(i64_prop(i64::MIN)).write(d, "prop_i64_min");
-    p0().add_prop(i64_prop(i64::MAX)).write(d, "prop_i64_max");
+        .write("prop_i64_neg");
+    p0().add_prop(i64_prop(i64::MIN)).write("prop_i64_min");
+    p0().add_prop(i64_prop(i64::MAX)).write("prop_i64_max");
 
     // u64 properties (note: uses "bignum" as property name)
     let u64_prop = |v| {
@@ -465,9 +464,9 @@ fn generate_properties(d: &Path) {
         )
     };
     p0().add_prop(u64_prop(1_234_567_890_123_456_789))
-        .write(d, "prop_u64");
-    p0().add_prop(u64_prop(0)).write(d, "prop_u64_min");
-    p0().add_prop(u64_prop(u64::MAX)).write(d, "prop_u64_max");
+        .write("prop_u64");
+    p0().add_prop(u64_prop(0)).write("prop_u64_min");
+    p0().add_prop(u64_prop(u64::MAX)).write("prop_u64_max");
 
     // f32 properties (matching Java Float constants)
     let f32_prop = |v| {
@@ -480,24 +479,23 @@ fn generate_properties(d: &Path) {
         )
     };
     #[expect(clippy::approx_constant)]
-    p0().add_prop(f32_prop(3.14)).write(d, "prop_f32");
+    p0().add_prop(f32_prop(3.14)).write("prop_f32");
     p0().add_prop(f32_prop(f32::NEG_INFINITY))
-        .write(d, "prop_f32_neg_inf");
+        .write("prop_f32_neg_inf");
     // Java Float.MIN_EXPONENT = -126 (stored as int in properties)
     p0().add_prop(i32("val", enc).add(-126))
-        .write(d, "prop_f32_min_exp");
+        .write("prop_f32_min_exp");
     // Java Float.MIN_NORMAL = 1.17549435E-38
     p0().add_prop(f32_prop(f32::MIN_POSITIVE))
-        .write(d, "prop_f32_min_norm");
-    p0().add_prop(f32_prop(0.0)).write(d, "prop_f32_zero");
-    p0().add_prop(f32_prop(f32::MAX))
-        .write(d, "prop_f32_max_val");
+        .write("prop_f32_min_norm");
+    p0().add_prop(f32_prop(0.0)).write("prop_f32_zero");
+    p0().add_prop(f32_prop(f32::MAX)).write("prop_f32_max_val");
     // Java Float.MAX_EXPONENT = 127 (stored as int in properties)
     p0().add_prop(i32("val", enc).add(127))
-        .write(d, "prop_f32_max_exp");
+        .write("prop_f32_max_exp");
     p0().add_prop(f32_prop(f32::INFINITY))
-        .write(d, "prop_f32_pos_inf");
-    p0().add_prop(f32_prop(f32::NAN)).write(d, "prop_f32_nan");
+        .write("prop_f32_pos_inf");
+    p0().add_prop(f32_prop(f32::NAN)).write("prop_f32_nan");
 
     // f64 properties (matching Java Double constants)
     let f64_prop = |v| {
@@ -511,17 +509,17 @@ fn generate_properties(d: &Path) {
     };
     #[expect(clippy::approx_constant)]
     p0().add_prop(f64_prop(3.141_592_653_589_793))
-        .write(d, "prop_f64");
+        .write("prop_f64");
     // Java Double.MIN_EXPONENT = -1022 (stored as int in properties)
     p0().add_prop(i32("val", enc).add(-1022))
-        .write(d, "prop_f64_min_exp");
+        .write("prop_f64_min_exp");
     // Java Double.MIN_NORMAL = 2.2250738585072014E-308
     p0().add_prop(f64_prop(f64::MIN_POSITIVE))
-        .write(d, "prop_f64_min_norm");
-    p0().add_prop(f64_prop(-0.0)).write(d, "prop_f64_neg_zero");
+        .write("prop_f64_min_norm");
+    p0().add_prop(f64_prop(-0.0)).write("prop_f64_neg_zero");
     // Java Double.MAX_EXPONENT = 1023 (stored as int in properties)
     p0().add_prop(i32("val", enc).add(1023))
-        .write(d, "prop_f64_max_exp");
+        .write("prop_f64_max_exp");
 
     // String properties
     let str_prop = |v: &str| {
@@ -533,18 +531,18 @@ fn generate_properties(d: &Path) {
             enc,
         )
     };
-    p0().add_prop(str_prop("")).write(d, "prop_str_empty");
-    p0().add_prop(str_prop("42")).write(d, "prop_str_ascii");
+    p0().add_prop(str_prop("")).write("prop_str_empty");
+    p0().add_prop(str_prop("42")).write("prop_str_ascii");
     p0().add_prop(str_prop("Line1\n\t\"quoted\"\\path"))
-        .write(d, "prop_str_escape");
+        .write("prop_str_escape");
     p0().add_prop(str_prop("München 📍 cafe\u{0301}"))
-        .write(d, "prop_str_unicode");
+        .write("prop_str_unicode");
 
     // props_mixed: single feature with multiple property types (using P1)
     // Java: name, active, count, medium(U32), bignum(I64), medium(U64), temp, precision
     // Note: Java has "medium" twice - first U32(100), then U64(0) - the second overwrites.
     // Java encodes 42L as I32 (value fits), but keeps U64(0) as U64.
-    let p1 = || geo_varint().geo(P1);
+    let p1 = || w.geo_varint().geo(P1);
     p1().add_prop(bool("active", enc).add(true))
         .add_prop(i32("bignum", enc).add(42))
         .add_prop(i32("count", enc).add(42))
@@ -558,18 +556,18 @@ fn generate_properties(d: &Path) {
         .add_prop(str_prop("Test Point").rename("name"))
         .add_prop(f64_prop(0.123_456_789).rename("precision"))
         .add_prop(f32_prop(25.5).rename("temp"))
-        .write(d, "props_mixed");
+        .write("props_mixed");
 
-    generate_props_i32(d);
-    generate_props_u32(d);
-    generate_props_u64(d);
-    generate_props_str(d);
-    generate_shared_dictionaries(d);
+    generate_props_i32(w);
+    generate_props_u32(w);
+    generate_props_u64(w);
+    generate_props_str(w);
+    generate_shared_dictionaries(w);
 }
 
-fn generate_props_i32(d: &Path) {
+fn generate_props_i32(w: &SynthWriter) {
     // Java uses: p0, p1, p2, p3 which are c0, c1, c2, c3
-    let four_points = || geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
+    let four_points = || w.geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
     let values = || DecodedProperty {
         name: "val".to_string(),
         values: PropValue::I32(vec![Some(42), Some(42), Some(42), Some(42)]),
@@ -580,30 +578,30 @@ fn generate_props_i32(d: &Path) {
             values(),
             PropertyEncoder::new(O::Present, L::None, P::VarInt),
         ))
-        .write(d, "props_i32");
+        .write("props_i32");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::Delta, P::VarInt),
         ))
-        .write(d, "props_i32_delta");
+        .write("props_i32_delta");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::Rle, P::VarInt),
         ))
-        .write(d, "props_i32_rle");
+        .write("props_i32_rle");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::DeltaRle, P::VarInt),
         ))
-        .write(d, "props_i32_delta_rle");
+        .write("props_i32_delta_rle");
 }
 
-fn generate_props_u32(d: &Path) {
+fn generate_props_u32(w: &SynthWriter) {
     // Java uses: p0, p1, p2, p3 which are c0, c1, c2, c3
-    let four_points = || geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
+    let four_points = || w.geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
     let values = || DecodedProperty {
         name: "val".to_string(),
         values: PropValue::U32(vec![Some(9000), Some(9000), Some(9000), Some(9000)]),
@@ -614,30 +612,30 @@ fn generate_props_u32(d: &Path) {
             values(),
             PropertyEncoder::new(O::Present, L::None, P::VarInt),
         ))
-        .write(d, "props_u32");
+        .write("props_u32");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::Delta, P::VarInt),
         ))
-        .write(d, "props_u32_delta");
+        .write("props_u32_delta");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::Rle, P::VarInt),
         ))
-        .write(d, "props_u32_rle");
+        .write("props_u32_rle");
     four_points()
         .add_prop(DecodedProp::new(
             values(),
             PropertyEncoder::new(O::Present, L::DeltaRle, P::VarInt),
         ))
-        .write(d, "props_u32_delta_rle");
+        .write("props_u32_delta_rle");
 }
 
-fn generate_props_u64(d: &Path) {
+fn generate_props_u64(w: &SynthWriter) {
     // Java uses: p0, p1, p2, p3 which are c0, c1, c2, c3
-    let four_points = || geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
+    let four_points = || w.geo_varint().meta(E::rle_varint()).geos([P0, P1, P2, P3]);
     let property = || DecodedProperty {
         name: "val".to_string(),
         values: PropValue::U64(vec![Some(9000), Some(9000), Some(9000), Some(9000)]),
@@ -648,31 +646,31 @@ fn generate_props_u64(d: &Path) {
             property(),
             PropertyEncoder::new(O::Present, L::None, P::VarInt),
         ))
-        .write(d, "props_u64");
+        .write("props_u64");
     four_points()
         .add_prop(DecodedProp::new(
             property(),
             PropertyEncoder::new(O::Present, L::Delta, P::VarInt),
         ))
-        .write(d, "props_u64_delta");
+        .write("props_u64_delta");
     four_points()
         .add_prop(DecodedProp::new(
             property(),
             PropertyEncoder::new(O::Present, L::Rle, P::VarInt),
         ))
-        .write(d, "props_u64_rle");
+        .write("props_u64_rle");
     four_points()
         .add_prop(DecodedProp::new(
             property(),
             PropertyEncoder::new(O::Present, L::DeltaRle, P::VarInt),
         ))
-        .write(d, "props_u64_delta_rle");
+        .write("props_u64_delta_rle");
 }
 
-fn generate_props_str(d: &Path) {
+fn generate_props_str(w: &SynthWriter) {
     // Java uses: p1, p2, p3, ph1, ph2, ph3 which are c1, c2, c3, h1, h2, h3
     let six_points = || {
-        geo_varint()
+        w.geo_varint()
             .meta(E::rle_varint())
             .geos([P1, P2, P3, PH1, PH2, PH3])
     };
@@ -695,7 +693,7 @@ fn generate_props_str(d: &Path) {
             },
             PropertyEncoder::new(O::Present, L::None, P::VarInt),
         ))
-        .write(d, "props_str");
+        .write("props_str");
     six_points()
         .add_prop(DecodedProp::new(
             DecodedProperty {
@@ -704,15 +702,15 @@ fn generate_props_str(d: &Path) {
             },
             PropertyEncoder::with_fsst(O::Present, L::None, P::VarInt),
         ))
-        .write(d, "props_str_fsst-rust"); // FSST compression output is not byte-for-byte consistent with Java's
+        .write("props_str_fsst-rust"); // FSST compression output is not byte-for-byte consistent with Java's
 }
 
-fn generate_shared_dictionaries(d: &Path) {
+fn generate_shared_dictionaries(w: &SynthWriter) {
     // Java uses p1 which is c1
     let enc = PropertyEncoder::new(O::Present, L::None, P::VarInt);
     let val = "A".repeat(30);
 
-    geo_varint()
+    w.geo_varint()
         .geo(P1)
         .add_prop(DecodedProp::new(
             DecodedProperty {
@@ -728,7 +726,7 @@ fn generate_shared_dictionaries(d: &Path) {
             },
             enc,
         ))
-        .write(d, "props_no_shared_dict");
+        .write("props_no_shared_dict");
 
     // TODO: props_shared_dict and props_shared_dict_fsst need shared dictionary support
 }

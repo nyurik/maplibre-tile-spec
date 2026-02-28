@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use geo::{Convert as _, TriangulateEarcut as _};
@@ -64,11 +64,69 @@ fn tessellate_polygon(polygon: &Polygon<i32>) -> (Vec<u32>, u32) {
     (indices_u32, num_triangles)
 }
 
-/// Default extent for synthetic test files (matching Java)
-const DEFAULT_EXTENT: u32 = 80;
+pub struct SynthWriter {
+    dir: PathBuf,
+}
+
+impl SynthWriter {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// Create a layer with all geometry encoders set to `VarInt`.
+    #[must_use]
+    pub fn geo_varint(&self) -> Layer {
+        Layer::new(self.dir.clone(), Encoder::varint())
+    }
+
+    /// Create a layer with all geometry encoders set to `FastPFOR`.
+    #[must_use]
+    pub fn geo_fastpfor(&self) -> Layer {
+        Layer::new(self.dir.clone(), Encoder::fastpfor())
+    }
+
+    /// Create a layer with auto-RLE detection matching Java's behavior.
+    /// This inspects the geometries and applies RLE encoding to streams
+    /// where all values are identical (single-run RLE).
+    #[must_use]
+    pub fn geo_varint_auto_rle(&self, geometries: &[Geom32]) -> Layer {
+        let rle_streams = detect_rle_streams(geometries);
+        let mut layer = Layer::new(self.dir.clone(), Encoder::varint());
+
+        if rle_streams.contains("meta") {
+            layer.geometry_encoder.meta(Encoder::rle_varint());
+        } else if rle_streams.contains("meta_delta_rle") {
+            layer.geometry_encoder.meta(Encoder::delta_rle_varint());
+        }
+        if rle_streams.contains("parts") {
+            // Parts stream (ring counts per polygon, or vertex counts when no rings) uses:
+            // - rings: Parts when geometry_offsets present and rings present (ring counts)
+            // - no_rings: Parts when geometry_offsets present but no rings (vertex counts)
+            // - parts: Parts when no geometry_offsets but rings present (ring counts)
+            // - only_parts: Parts when no geometry_offsets and no rings (vertex counts)
+            layer.geometry_encoder.rings(Encoder::rle_varint());
+            layer.geometry_encoder.no_rings(Encoder::rle_varint());
+            layer.geometry_encoder.parts(Encoder::rle_varint());
+            layer.geometry_encoder.only_parts(Encoder::rle_varint());
+        }
+        if rle_streams.contains("rings") {
+            // Rings stream (vertex counts per ring/linestring) uses:
+            // - rings2: Rings when geometry_offsets present
+            // - parts_ring: Rings when no geometry_offsets but rings present
+            layer.geometry_encoder.rings2(Encoder::rle_varint());
+            layer.geometry_encoder.parts_ring(Encoder::rle_varint());
+        }
+        if rle_streams.contains("geometries") {
+            layer.geometry_encoder.num_geometries(Encoder::rle_varint());
+        }
+
+        layer
+    }
+}
 
 /// Layer builder: holds geometry encoder, geometry list, properties, extent, and IDs.
 pub struct Layer {
+    path: PathBuf,
     geometry_encoder: GeometryEncoder,
     geometry_items: Vec<Geom32>,
     /// Polygons that are also tessellated; triangle data is merged when building decoded geometry.
@@ -78,22 +136,11 @@ pub struct Layer {
     ids: Option<(Vec<Option<u64>>, IdEncoder)>,
 }
 
-/// Create a layer with all geometry encoders set to `VarInt`.
-#[must_use]
-pub fn geo_varint() -> Layer {
-    Layer::new(Encoder::varint())
-}
-
-/// Create a layer with all geometry encoders set to `FastPFOR`.
-#[must_use]
-pub fn geo_fastpfor() -> Layer {
-    Layer::new(Encoder::fastpfor())
-}
-
 impl Layer {
     #[must_use]
-    pub fn new(default_geom_enc: Encoder) -> Layer {
+    pub fn new(path: PathBuf, default_geom_enc: Encoder) -> Layer {
         Layer {
+            path,
             geometry_encoder: GeometryEncoder::all(default_geom_enc),
             geometry_items: vec![],
             tessellated_polygons: vec![],
@@ -250,8 +297,9 @@ impl Layer {
     }
 
     /// Write the layer to an MLT file and a corresponding JSON file (consumes self).
-    pub fn write(self, dir: &Path, name: impl AsRef<str>) {
+    pub fn write(self, name: impl AsRef<str>) {
         let name = name.as_ref();
+        let dir = self.path.clone();
         let path = dir.join(format!("{name}.mlt"));
         self.write_mlt(&path);
 
@@ -300,7 +348,7 @@ impl Layer {
 
         let layer = OwnedLayer::Tag01(OwnedLayer01 {
             name: "layer1".to_string(),
-            extent: self.extent.unwrap_or(DEFAULT_EXTENT),
+            extent: self.extent.unwrap_or(80),
             id,
             geometry,
             properties: merged_props
@@ -483,8 +531,8 @@ fn is_const_stream<T: PartialEq>(values: &[T]) -> bool {
 
 /// Check if RLE encoding would be beneficial (Java's AUTO selection).
 /// Java forces RLE for const streams (single run). For multi-run cases,
-/// it compares encoded sizes: plain (num_values bytes) vs RLE (2 * runs bytes).
-/// RLE is beneficial when 2 * runs < num_values.
+/// it compares encoded sizes: plain (`num_values` bytes) vs RLE (2 * runs bytes).
+/// RLE is beneficial when `2 * runs < num_values`.
 fn should_use_rle(values: &[u32]) -> bool {
     if values.len() < 2 {
         return false;
@@ -513,9 +561,9 @@ fn count_runs<T: PartialEq>(values: &[T]) -> usize {
     runs
 }
 
-/// Check if values form a sequential pattern that benefits from DeltaRle.
+/// Check if values form a sequential pattern that benefits from `DeltaRle`.
 /// After delta encoding, sequential values like [1,2,3] become [1,1,1].
-/// Java uses DeltaRle when it produces smaller output than plain or delta encoding.
+/// Java uses `DeltaRle` when it produces smaller output than plain or delta encoding.
 fn is_delta_rle_beneficial(values: &[u8]) -> bool {
     if values.len() < 3 {
         // DeltaRle needs at least 3 values to be beneficial
@@ -646,45 +694,7 @@ fn geom_type_byte(g: &Geom32) -> u8 {
     }
 }
 
-/// Check if geometry is a polygon type (Polygon or MultiPolygon)
+/// Check if geometry is a polygon type (`Polygon` or `MultiPolygon`)
 fn is_polygon_type(g: &Geom32) -> bool {
     matches!(g, Geom32::Polygon(_) | Geom32::MultiPolygon(_))
-}
-
-/// Create a layer with auto-RLE detection matching Java's behavior.
-/// This inspects the geometries and applies RLE encoding to streams
-/// where all values are identical (single-run RLE).
-#[must_use]
-pub fn geo_varint_auto_rle(geometries: &[Geom32]) -> Layer {
-    let rle_streams = detect_rle_streams(geometries);
-    let mut layer = Layer::new(Encoder::varint());
-
-    if rle_streams.contains("meta") {
-        layer.geometry_encoder.meta(Encoder::rle_varint());
-    } else if rle_streams.contains("meta_delta_rle") {
-        layer.geometry_encoder.meta(Encoder::delta_rle_varint());
-    }
-    if rle_streams.contains("parts") {
-        // Parts stream (ring counts per polygon, or vertex counts when no rings) uses:
-        // - rings: Parts when geometry_offsets present and rings present (ring counts)
-        // - no_rings: Parts when geometry_offsets present but no rings (vertex counts)
-        // - parts: Parts when no geometry_offsets but rings present (ring counts)
-        // - only_parts: Parts when no geometry_offsets and no rings (vertex counts)
-        layer.geometry_encoder.rings(Encoder::rle_varint());
-        layer.geometry_encoder.no_rings(Encoder::rle_varint());
-        layer.geometry_encoder.parts(Encoder::rle_varint());
-        layer.geometry_encoder.only_parts(Encoder::rle_varint());
-    }
-    if rle_streams.contains("rings") {
-        // Rings stream (vertex counts per ring/linestring) uses:
-        // - rings2: Rings when geometry_offsets present
-        // - parts_ring: Rings when no geometry_offsets but rings present
-        layer.geometry_encoder.rings2(Encoder::rle_varint());
-        layer.geometry_encoder.parts_ring(Encoder::rle_varint());
-    }
-    if rle_streams.contains("geometries") {
-        layer.geometry_encoder.num_geometries(Encoder::rle_varint());
-    }
-
-    layer
 }
