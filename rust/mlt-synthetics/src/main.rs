@@ -17,7 +17,7 @@ use mlt_core::v01::{
     PresenceStream as O, PropValue, PropertyEncoder,
 };
 
-use crate::layer::{DecodedProp, bool, geo_fastpfor, geo_varint, i32};
+use crate::layer::{DecodedProp, bool, geo_fastpfor, geo_varint, geo_varint_auto_rle, i32};
 
 // Coordinate constants matching Java SyntheticMltUtil.java
 // Using SRID=0 tile space; Use tiny tile extent 80 for most geometry tests.
@@ -54,8 +54,7 @@ fn main() {
     println!("Generating synthetic test data in {}", dir.display());
 
     generate_geometry(&dir);
-    // FIXME: Mixed geometry encoding has bugs in mlt-core encoder - skipping for now
-    // generate_mixed(&dir);
+    generate_mixed(&dir);
     generate_extent(&dir);
     generate_ids(&dir);
     generate_properties(&dir);
@@ -115,7 +114,6 @@ fn generate_geometry(d: &Path) {
 }
 
 /// Generate all k-combinations of geometry types
-#[allow(dead_code)]
 fn generate_mixed_combine<'a>(
     d: &Path,
     types: &[(&'a str, Geom32)],
@@ -137,9 +135,11 @@ fn generate_mixed_combine<'a>(
         if skip.contains(name.as_str()) {
             return;
         }
-        let mut layer = geo_varint();
-        for (_, geo) in current.iter() {
-            layer = layer.geo(geo.clone());
+        // Collect geometries for auto-RLE detection
+        let geoms: Vec<Geom32> = current.iter().map(|(_, g)| g.clone()).collect();
+        let mut layer = geo_varint_auto_rle(&geoms);
+        for geo in geoms {
+            layer = layer.geo(geo);
         }
         layer.write(d, &name);
     } else {
@@ -154,7 +154,6 @@ fn generate_mixed_combine<'a>(
     }
 }
 
-#[allow(dead_code)]
 fn generate_mixed(d: &Path) {
     // Coordinates matching Java SyntheticMltGenerator.generateMixed()
     let c = |x, y| coord! { x: x, y: y };
@@ -212,17 +211,23 @@ fn generate_mixed(d: &Path) {
     for (na, ga) in &types {
         // A-A variant: mix_dup_<a>
         let name = format!("mix_dup_{na}");
-        geo_varint().geo(ga.clone()).geo(ga.clone()).write(d, &name);
+        let geoms = vec![ga.clone(), ga.clone()];
+        let mut layer = geo_varint_auto_rle(&geoms);
+        for g in geoms {
+            layer = layer.geo(g);
+        }
+        layer.write(d, &name);
 
         for (nb, gb) in &types {
             if na != nb {
                 // A-B-A variant: mix_<a>_<b>_<a>
                 let name = format!("mix_{na}_{nb}_{na}");
-                geo_varint()
-                    .geo(ga.clone())
-                    .geo(gb.clone())
-                    .geo(ga.clone())
-                    .write(d, &name);
+                let geoms = vec![ga.clone(), gb.clone(), ga.clone()];
+                let mut layer = geo_varint_auto_rle(&geoms);
+                for g in geoms {
+                    layer = layer.geo(g);
+                }
+                layer.write(d, &name);
             }
         }
     }

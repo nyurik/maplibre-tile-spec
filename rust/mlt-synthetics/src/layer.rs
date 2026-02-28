@@ -1,5 +1,6 @@
 #![expect(dead_code)]
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -472,4 +473,218 @@ impl LayerProp for DecodedProp {
     fn to_decoded(&self) -> (DecodedProperty, PropertyEncoder) {
         (self.prop.clone(), self.enc)
     }
+}
+
+/// Check if all values in a slice are identical (single RLE run).
+/// This matches Java's "isConstStream" logic for auto-RLE detection.
+fn is_const_stream<T: PartialEq>(values: &[T]) -> bool {
+    values.len() >= 2 && values.iter().all(|v| v == &values[0])
+}
+
+/// Check if RLE encoding would be beneficial (Java's AUTO selection).
+/// Java forces RLE for const streams (single run). For multi-run cases,
+/// it compares encoded sizes: plain (num_values bytes) vs RLE (2 * runs bytes).
+/// RLE is beneficial when 2 * runs < num_values.
+fn should_use_rle(values: &[u32]) -> bool {
+    if values.len() < 2 {
+        return false;
+    }
+    let runs = count_runs(values);
+    // Java forces RLE for const streams (single run)
+    if runs == 1 {
+        return true;
+    }
+    // For multi-run cases, RLE uses 2 bytes per run, plain uses 1 byte per value
+    // RLE is smaller when: 2 * runs < values.len()
+    values.len() > 2 * runs
+}
+
+/// Count the number of runs in a slice (consecutive identical values)
+fn count_runs<T: PartialEq>(values: &[T]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut runs = 1;
+    for i in 1..values.len() {
+        if values[i] != values[i - 1] {
+            runs += 1;
+        }
+    }
+    runs
+}
+
+/// Check if values form a sequential pattern that benefits from DeltaRle.
+/// After delta encoding, sequential values like [1,2,3] become [1,1,1].
+/// Java uses DeltaRle when it produces smaller output than plain or delta encoding.
+fn is_delta_rle_beneficial(values: &[u8]) -> bool {
+    if values.len() < 3 {
+        // DeltaRle needs at least 3 values to be beneficial
+        return false;
+    }
+    // Apply delta encoding
+    let mut deltas: Vec<u32> = Vec::with_capacity(values.len());
+    deltas.push(u32::from(values[0]));
+    for i in 1..values.len() {
+        deltas.push(u32::from(values[i].wrapping_sub(values[i - 1])));
+    }
+    // Check if delta+RLE would be beneficial using the same logic as should_use_rle
+    should_use_rle(&deltas)
+}
+
+/// Count MLT-style vertices (excludes closing vertex if ring is closed)
+fn mlt_vertex_count(coords: &LineString<i32>) -> u32 {
+    let len = coords.0.len();
+    if len > 1 && coords.0.first() == coords.0.last() {
+        // Closed ring: exclude the closing vertex that duplicates the first
+        (len - 1) as u32
+    } else {
+        len as u32
+    }
+}
+
+/// Determine which streams should use RLE based on geometry data.
+/// This replicates Java's auto-RLE detection for geometry streams.
+/// Returns a set of stream names that should use RLE, plus "meta_delta_rle" for DeltaRle.
+pub fn detect_rle_streams(geometries: &[Geom32]) -> HashSet<&'static str> {
+    let mut rle_streams = HashSet::new();
+
+    // Collect geometry type bytes
+    let type_bytes: Vec<u8> = geometries.iter().map(|g| geom_type_byte(g)).collect();
+    if is_const_stream(&type_bytes) {
+        rle_streams.insert("meta");
+    } else if is_delta_rle_beneficial(&type_bytes) {
+        rle_streams.insert("meta_delta_rle");
+    }
+
+    // parts_counts: ring counts per polygon (for Parts stream when rings present),
+    // OR linestring vertex counts (for Parts stream when rings absent)
+    let mut parts_counts: Vec<u32> = Vec::new();
+    // rings_counts: vertex counts per ring/linestring (for Rings stream)
+    let mut rings_counts: Vec<u32> = Vec::new();
+    // Collect sub-geometry counts per Multi* type (for Geometries stream)
+    let mut sub_geom_counts: Vec<u32> = Vec::new();
+
+    let has_polygon = geometries.iter().any(is_polygon_type);
+
+    for g in geometries {
+        match g {
+            Geom32::Point(_) => {}
+            Geom32::LineString(ls) => {
+                if has_polygon {
+                    // When polygon is present, linestring vertex counts go to Rings stream
+                    rings_counts.push(ls.0.len() as u32);
+                } else {
+                    // Without polygon, linestring vertex counts go to Parts stream
+                    parts_counts.push(ls.0.len() as u32);
+                }
+            }
+            Geom32::Polygon(p) => {
+                // Ring count (exterior + interiors) goes to Parts
+                let ring_count = 1 + p.interiors().len() as u32;
+                parts_counts.push(ring_count);
+                // Vertex counts for each ring (MLT-style: excludes closing vertex) go to Rings
+                rings_counts.push(mlt_vertex_count(p.exterior()));
+                for interior in p.interiors() {
+                    rings_counts.push(mlt_vertex_count(interior));
+                }
+            }
+            Geom32::MultiPoint(mp) => {
+                sub_geom_counts.push(mp.0.len() as u32);
+            }
+            Geom32::MultiLineString(mls) => {
+                sub_geom_counts.push(mls.0.len() as u32);
+                for ls in &mls.0 {
+                    if has_polygon {
+                        // With polygon, linestring vertex counts go to Rings
+                        rings_counts.push(ls.0.len() as u32);
+                    } else {
+                        // Without polygon, linestring vertex counts go to Parts
+                        parts_counts.push(ls.0.len() as u32);
+                    }
+                }
+            }
+            Geom32::MultiPolygon(mp) => {
+                sub_geom_counts.push(mp.0.len() as u32);
+                for p in &mp.0 {
+                    let ring_count = 1 + p.interiors().len() as u32;
+                    parts_counts.push(ring_count);
+                    // Vertex counts for each ring (MLT-style: excludes closing vertex)
+                    rings_counts.push(mlt_vertex_count(p.exterior()));
+                    for interior in p.interiors() {
+                        rings_counts.push(mlt_vertex_count(interior));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Use Java's AUTO selection: RLE if values/runs >= 2
+    if should_use_rle(&parts_counts) {
+        rle_streams.insert("parts");
+    }
+    if should_use_rle(&rings_counts) {
+        rle_streams.insert("rings");
+    }
+    if should_use_rle(&sub_geom_counts) {
+        rle_streams.insert("geometries");
+    }
+
+    rle_streams
+}
+
+/// Get the geometry type byte for a geometry (matching Java's encoding)
+fn geom_type_byte(g: &Geom32) -> u8 {
+    match g {
+        Geom32::Point(_) => 0,
+        Geom32::LineString(_) => 1,
+        Geom32::Polygon(_) => 2,
+        Geom32::MultiPoint(_) => 3,
+        Geom32::MultiLineString(_) => 4,
+        Geom32::MultiPolygon(_) => 5,
+        _ => 6, // GeometryCollection
+    }
+}
+
+/// Check if geometry is a polygon type (Polygon or MultiPolygon)
+fn is_polygon_type(g: &Geom32) -> bool {
+    matches!(g, Geom32::Polygon(_) | Geom32::MultiPolygon(_))
+}
+
+/// Create a layer with auto-RLE detection matching Java's behavior.
+/// This inspects the geometries and applies RLE encoding to streams
+/// where all values are identical (single-run RLE).
+#[must_use]
+pub fn geo_varint_auto_rle(geometries: &[Geom32]) -> Layer {
+    let rle_streams = detect_rle_streams(geometries);
+    let mut layer = Layer::new(Encoder::varint());
+
+    if rle_streams.contains("meta") {
+        layer.geometry_encoder.meta(Encoder::rle_varint());
+    } else if rle_streams.contains("meta_delta_rle") {
+        layer.geometry_encoder.meta(Encoder::delta_rle_varint());
+    }
+    if rle_streams.contains("parts") {
+        // Parts stream (ring counts per polygon, or vertex counts when no rings) uses:
+        // - rings: Parts when geometry_offsets present and rings present (ring counts)
+        // - no_rings: Parts when geometry_offsets present but no rings (vertex counts)
+        // - parts: Parts when no geometry_offsets but rings present (ring counts)
+        // - only_parts: Parts when no geometry_offsets and no rings (vertex counts)
+        layer.geometry_encoder.rings(Encoder::rle_varint());
+        layer.geometry_encoder.no_rings(Encoder::rle_varint());
+        layer.geometry_encoder.parts(Encoder::rle_varint());
+        layer.geometry_encoder.only_parts(Encoder::rle_varint());
+    }
+    if rle_streams.contains("rings") {
+        // Rings stream (vertex counts per ring/linestring) uses:
+        // - rings2: Rings when geometry_offsets present
+        // - parts_ring: Rings when no geometry_offsets but rings present
+        layer.geometry_encoder.rings2(Encoder::rle_varint());
+        layer.geometry_encoder.parts_ring(Encoder::rle_varint());
+    }
+    if rle_streams.contains("geometries") {
+        layer.geometry_encoder.num_geometries(Encoder::rle_varint());
+    }
+
+    layer
 }
