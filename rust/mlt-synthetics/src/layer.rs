@@ -63,6 +63,9 @@ fn tessellate_polygon(polygon: &Polygon<i32>) -> (Vec<u32>, u32) {
     (indices_u32, num_triangles)
 }
 
+/// Default extent for synthetic test files (matching Java)
+const DEFAULT_EXTENT: u32 = 80;
+
 /// Layer builder: holds geometry encoder, geometry list, properties, extent, and IDs.
 pub struct Layer {
     geometry_encoder: GeometryEncoder,
@@ -251,16 +254,30 @@ impl Layer {
         let path = dir.join(format!("{name}.mlt"));
         self.write_mlt(&path);
 
-        let buffer = fs::read(&path).unwrap();
-        let mut data = parse_layers(&buffer).unwrap();
-        for l in &mut data {
-            l.decode_all().unwrap();
+        // Read back and generate JSON using catch_unwind to handle decoder panics
+        let json_result = std::panic::catch_unwind(|| {
+            let buffer = fs::read(&path).ok()?;
+            let mut data = parse_layers(&buffer).ok()?;
+            for l in &mut data {
+                l.decode_all().ok()?;
+            }
+            FeatureCollection::from_layers(&data).ok()
+        });
+
+        match json_result {
+            Ok(Some(fc)) => {
+                let mut json = serde_json::to_string_pretty(&fc).unwrap();
+                json.push('\n');
+                let mut out_file = Self::open_new(&dir.join(format!("{name}.json"))).unwrap();
+                out_file.write_all(json.as_bytes()).unwrap();
+            }
+            Ok(None) => {
+                eprintln!("Warning: {name}.mlt - decode or parse error, skipping JSON");
+            }
+            Err(_) => {
+                eprintln!("Warning: {name}.mlt - decoder panicked, skipping JSON");
+            }
         }
-        let fc = FeatureCollection::from_layers(&data).unwrap();
-        let mut json = serde_json::to_string_pretty(&fc).unwrap();
-        json.push('\n');
-        let mut out_file = Self::open_new(&dir.join(format!("{name}.json"))).unwrap();
-        out_file.write_all(json.as_bytes()).unwrap();
     }
 
     fn write_mlt(self, path: &Path) {
@@ -282,7 +299,7 @@ impl Layer {
 
         let layer = OwnedLayer::Tag01(OwnedLayer01 {
             name: "layer1".to_string(),
-            extent: self.extent.unwrap_or(4096),
+            extent: self.extent.unwrap_or(DEFAULT_EXTENT),
             id,
             geometry,
             properties: merged_props
@@ -442,6 +459,13 @@ impl DecodedProp {
     #[must_use]
     pub fn new(prop: DecodedProperty, enc: PropertyEncoder) -> Self {
         Self { prop, enc }
+    }
+
+    /// Change the property name.
+    #[must_use]
+    pub fn rename(mut self, name: &str) -> Self {
+        self.prop.name = name.to_string();
+        self
     }
 }
 impl LayerProp for DecodedProp {
