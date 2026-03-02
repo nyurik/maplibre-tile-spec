@@ -65,6 +65,223 @@ ci-env-info:
     cat /proc/cpuinfo
     @echo "::endgroup::"
 
+# Debug AMD AVX SIGILL issue - runs only the failing test with maximum diagnostics
+# See: https://github.com/maplibre/maplibre-tile-spec/issues/1016
+ci-debug-amd-avx:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DEBUG_DIR="target/amd-avx-debug"
+    mkdir -p "$DEBUG_DIR"
+
+    echo "============================================================"
+    echo "DEBUG: AMD AVX SIGILL Investigation"
+    echo "Issue: https://github.com/maplibre/maplibre-tile-spec/issues/1016"
+    echo "============================================================"
+
+    # Collect all environment info to a file
+    ENV_FILE="$DEBUG_DIR/environment.txt"
+    echo "=== Environment Info ===" > "$ENV_FILE"
+    echo "Date: $(date -u)" >> "$ENV_FILE"
+    echo "Hostname: $(hostname)" >> "$ENV_FILE"
+    echo "Kernel: $(uname -a)" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== Rust Toolchain ===" >> "$ENV_FILE"
+    rustc --version >> "$ENV_FILE"
+    cargo --version >> "$ENV_FILE"
+    echo "RUSTFLAGS=$RUSTFLAGS" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== C++ Compiler ===" >> "$ENV_FILE"
+    which g++ >> "$ENV_FILE" 2>&1 || echo "g++ not found" >> "$ENV_FILE"
+    g++ --version >> "$ENV_FILE" 2>&1 || echo "g++ version failed" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+    which clang++ >> "$ENV_FILE" 2>&1 || echo "clang++ not found" >> "$ENV_FILE"
+    clang++ --version >> "$ENV_FILE" 2>&1 || echo "clang++ version failed" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== CMake ===" >> "$ENV_FILE"
+    cmake --version >> "$ENV_FILE" 2>&1 || echo "cmake not found" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== GCC -march=native expansion ===" >> "$ENV_FILE"
+    gcc -march=native -Q --help=target 2>&1 | grep -E '^\s+-(march|mtune|msse|mavx|mfma|mbmi)' >> "$ENV_FILE" || echo "Failed to get gcc flags" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== Virtualization ===" >> "$ENV_FILE"
+    cat /sys/devices/virtual/dmi/id/sys_vendor >> "$ENV_FILE" 2>&1 || echo "sys_vendor: N/A" >> "$ENV_FILE"
+    systemd-detect-virt >> "$ENV_FILE" 2>&1 || echo "systemd-detect-virt: N/A" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== OS Release ===" >> "$ENV_FILE"
+    cat /etc/os-release >> "$ENV_FILE" 2>&1 || echo "os-release: N/A" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    # Save CPU info separately
+    echo "=== lscpu ===" > "$DEBUG_DIR/lscpu.txt"
+    lscpu >> "$DEBUG_DIR/lscpu.txt" 2>&1
+
+    echo "=== /proc/cpuinfo ===" > "$DEBUG_DIR/cpuinfo.txt"
+    cat /proc/cpuinfo >> "$DEBUG_DIR/cpuinfo.txt" 2>&1
+
+    # Extract just the flags for easy comparison
+    echo "=== CPU Flags ===" > "$DEBUG_DIR/cpu_flags.txt"
+    grep -m1 'flags' /proc/cpuinfo | tr ' ' '\n' | sort >> "$DEBUG_DIR/cpu_flags.txt" 2>&1
+
+    # AVX-specific flags
+    echo "=== AVX-related flags ===" > "$DEBUG_DIR/avx_flags.txt"
+    grep -m1 'flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(sse|avx|fma|bmi)' | sort >> "$DEBUG_DIR/avx_flags.txt" 2>&1
+
+    # CPU microcode
+    echo "=== CPU Microcode ===" > "$DEBUG_DIR/microcode.txt"
+    cat /sys/devices/system/cpu/cpu0/microcode/version >> "$DEBUG_DIR/microcode.txt" 2>&1 || echo "N/A" >> "$DEBUG_DIR/microcode.txt"
+
+    # CPU vulnerabilities (mitigations can affect behavior)
+    echo "=== CPU Vulnerabilities ===" > "$DEBUG_DIR/vulnerabilities.txt"
+    for f in /sys/devices/system/cpu/vulnerabilities/*; do
+        echo "$(basename $f): $(cat $f)" >> "$DEBUG_DIR/vulnerabilities.txt" 2>&1
+    done
+
+    # Test basic AVX2 execution
+    echo "=== Testing basic AVX2 execution ===" | tee "$DEBUG_DIR/avx_test.txt"
+    cat > /tmp/avx_test.cpp << 'CPPEOF'
+    #include <immintrin.h>
+    #include <cstdio>
+    int main() {
+        printf("Testing AVX2 instructions...\n");
+        __m256i a = _mm256_set1_epi32(42);
+        __m256i b = _mm256_add_epi32(a, a);
+        int result = _mm256_extract_epi32(b, 0);
+        printf("AVX2 _mm256_add_epi32 result: %d (expected 84)\n", result);
+        return (result == 84) ? 0 : 1;
+    }
+    CPPEOF
+
+    g++ -march=native -o /tmp/avx_test /tmp/avx_test.cpp 2>&1 | tee -a "$DEBUG_DIR/avx_test.txt"
+    /tmp/avx_test 2>&1 | tee -a "$DEBUG_DIR/avx_test.txt" || echo "AVX2 test FAILED with exit code $?" | tee -a "$DEBUG_DIR/avx_test.txt"
+
+    # Show what instructions gcc generates with -march=native
+    echo "=== GCC -march=native code generation ===" > "$DEBUG_DIR/gcc_codegen.txt"
+    cat > /tmp/codegen_test.cpp << 'CPPEOF'
+    #include <immintrin.h>
+    extern "C" __m256i test_avx2(__m256i a) {
+        return _mm256_add_epi32(a, a);
+    }
+    CPPEOF
+
+    g++ -march=native -S -o /tmp/codegen_test.s /tmp/codegen_test.cpp 2>&1
+    cat /tmp/codegen_test.s >> "$DEBUG_DIR/gcc_codegen.txt" 2>&1
+
+    echo ""
+    echo "=== Building test binary ==="
+    # Build only the mlt-core tests
+    cargo test -p mlt-core --no-run --all-features 2>&1 | tee "$DEBUG_DIR/build_output.txt"
+
+    # Find the test binary
+    TEST_BIN=$(cargo test -p mlt-core --no-run --all-features --message-format=json 2>/dev/null | \
+        jq -r 'select(.executable != null and .target.name == "mlt-core") | .executable' | head -1)
+    echo "Test binary: $TEST_BIN" | tee -a "$DEBUG_DIR/build_output.txt"
+
+    if [ -n "$TEST_BIN" ] && [ -f "$TEST_BIN" ]; then
+        # Disassemble functions containing "fastpfor" or "FastPFor"
+        echo "=== Disassembly of FastPFor-related code ===" > "$DEBUG_DIR/disassembly.txt"
+        objdump -d "$TEST_BIN" 2>/dev/null | grep -A 50 -i 'fastpfor\|FastPFor' | head -500 >> "$DEBUG_DIR/disassembly.txt" 2>&1 || echo "No fastpfor symbols found" >> "$DEBUG_DIR/disassembly.txt"
+
+        # Check for AVX instructions in the binary
+        echo "=== AVX instruction count in test binary ===" > "$DEBUG_DIR/avx_instructions.txt"
+        objdump -d "$TEST_BIN" 2>/dev/null | grep -cE '\s(vmov|vadd|vperm|vxor|vpand|vpadd)' >> "$DEBUG_DIR/avx_instructions.txt" 2>&1 || echo "0" >> "$DEBUG_DIR/avx_instructions.txt"
+
+        # List all ymm register usage (AVX 256-bit)
+        echo "=== ymm register (AVX) usage count ===" >> "$DEBUG_DIR/avx_instructions.txt"
+        objdump -d "$TEST_BIN" 2>/dev/null | grep -cE 'ymm[0-9]+' >> "$DEBUG_DIR/avx_instructions.txt" 2>&1 || echo "0" >> "$DEBUG_DIR/avx_instructions.txt"
+    fi
+
+    # Find and save CMake build logs from fastpfor
+    echo "=== Looking for fastpfor CMake logs ===" | tee "$DEBUG_DIR/cmake_logs.txt"
+    find target -name 'CMakeOutput.log' -o -name 'CMakeError.log' -o -name 'CMakeCache.txt' 2>/dev/null | head -10 | while read f; do
+        echo "--- $f ---" >> "$DEBUG_DIR/cmake_logs.txt"
+        cat "$f" >> "$DEBUG_DIR/cmake_logs.txt" 2>&1
+        echo "" >> "$DEBUG_DIR/cmake_logs.txt"
+    done
+
+    echo ""
+    echo "=== Running the failing test ==="
+    echo "Test: test_fastpfor_roundtrip::case_2_large"
+    echo ""
+
+    # Run with RUST_BACKTRACE=full
+    export RUST_BACKTRACE=full
+
+    # Try running with different verbosity levels and capture output
+    echo "=== Test execution output ===" > "$DEBUG_DIR/test_output.txt"
+
+    # First, try running normally
+    set +e
+    cargo test -p mlt-core --all-features \
+        layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large \
+        --include-ignored \
+        -- --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/test_output.txt"
+    TEST_EXIT_CODE=$?
+    set -e
+
+    echo "" | tee -a "$DEBUG_DIR/test_output.txt"
+    echo "Test exit code: $TEST_EXIT_CODE" | tee -a "$DEBUG_DIR/test_output.txt"
+
+    # If test failed, try to get more info
+    if [ $TEST_EXIT_CODE -ne 0 ]; then
+        echo "" | tee -a "$DEBUG_DIR/test_output.txt"
+        echo "=== Test FAILED - collecting additional debug info ===" | tee -a "$DEBUG_DIR/test_output.txt"
+
+        # Try running with gdb if available
+        if command -v gdb &> /dev/null && [ -n "$TEST_BIN" ]; then
+            echo "=== Running with GDB to catch SIGILL ===" | tee "$DEBUG_DIR/gdb_output.txt"
+            gdb -batch \
+                -ex "set pagination off" \
+                -ex "run layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large --include-ignored --test-threads=1" \
+                -ex "bt full" \
+                -ex "info registers" \
+                -ex "x/10i \$pc-20" \
+                -ex "x/10i \$pc" \
+                --args "$TEST_BIN" 2>&1 | tee -a "$DEBUG_DIR/gdb_output.txt" || true
+        else
+            echo "GDB not available or test binary not found" | tee "$DEBUG_DIR/gdb_output.txt"
+        fi
+
+        # Try with lldb if available
+        if command -v lldb &> /dev/null && [ -n "$TEST_BIN" ]; then
+            echo "=== Running with LLDB ===" | tee "$DEBUG_DIR/lldb_output.txt"
+            lldb -b \
+                -o "run layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large --include-ignored --test-threads=1" \
+                -o "bt all" \
+                -o "register read" \
+                -o "disassemble -p -c 20" \
+                -- "$TEST_BIN" 2>&1 | tee -a "$DEBUG_DIR/lldb_output.txt" || true
+        fi
+    fi
+
+    # Print summary
+    echo ""
+    echo "============================================================"
+    echo "DEBUG ARTIFACTS SAVED TO: $DEBUG_DIR"
+    echo "============================================================"
+    ls -la "$DEBUG_DIR"
+    echo ""
+
+    # Print key info to stdout for easy viewing in CI logs
+    echo "=== Key Environment Summary ==="
+    cat "$ENV_FILE"
+    echo ""
+    echo "=== AVX Flags ==="
+    cat "$DEBUG_DIR/avx_flags.txt"
+    echo ""
+    echo "=== AVX2 Basic Test Result ==="
+    cat "$DEBUG_DIR/avx_test.txt"
+    echo ""
+
+    # Exit with the test result
+    exit $TEST_EXIT_CODE
+
 # Run linting as expected by CI
 ci-lint: ci-env-info test-fmt clippy
     {{just}} assert-git-is-clean  # call it explicitly to avoid just optimizing it to just one call
