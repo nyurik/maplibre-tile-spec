@@ -17,6 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: ./.github/actions/mlt-setup-rust
+      - run: just -v rust::ci-env-info
       - name: Install debug tools
         run: |
           sudo apt-get update
