@@ -57,6 +57,12 @@ ci-env-info:
     @echo "RUST_BACKTRACE='$RUST_BACKTRACE'"
     @echo "::endgroup::"
 
+    @echo "::group::C++ compiler info"
+    g++ --version || echo "g++ not found"
+    dpkg -l | grep -E '^ii\s+(gcc|g\+\+)' || echo "dpkg not available"
+    gcc -march=native -Q --help=target 2>&1 | grep -E '^\s+-(march|mtune|mvaes|mvpclmulqdq|msha|mavx|mbmi|mfma)' || echo "Failed to get native march flags"
+    @echo "::endgroup::"
+
     @echo "::group::lscpu"
     lscpu
     @echo "::endgroup::"
@@ -101,12 +107,32 @@ ci-debug-amd-avx:
     clang++ --version >> "$ENV_FILE" 2>&1 || echo "clang++ version failed" >> "$ENV_FILE"
     echo "" >> "$ENV_FILE"
 
+    echo "=== Installed GCC/G++ packages ===" >> "$ENV_FILE"
+    dpkg -l | grep -E '^ii\s+(gcc|g\+\+)' >> "$ENV_FILE" 2>&1 || echo "dpkg not available" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== Active compiler symlinks ===" >> "$ENV_FILE"
+    ls -la $(which gcc 2>/dev/null) $(which g++ 2>/dev/null) >> "$ENV_FILE" 2>&1 || true
+    echo "" >> "$ENV_FILE"
+
+    echo "=== libc version ===" >> "$ENV_FILE"
+    ldd --version >> "$ENV_FILE" 2>&1 || echo "ldd not found" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
     echo "=== CMake ===" >> "$ENV_FILE"
     cmake --version >> "$ENV_FILE" 2>&1 || echo "cmake not found" >> "$ENV_FILE"
     echo "" >> "$ENV_FILE"
 
     echo "=== GCC -march=native expansion ===" >> "$ENV_FILE"
-    gcc -march=native -Q --help=target 2>&1 | grep -E '^\s+-(march|mtune|msse|mavx|mfma|mbmi)' >> "$ENV_FILE" || echo "Failed to get gcc flags" >> "$ENV_FILE"
+    gcc -march=native -Q --help=target 2>&1 | grep -E '^\s+-(march|mtune|msse|mavx|mfma|mbmi|mvaes|mvpclmulqdq|msha)' >> "$ENV_FILE" || echo "Failed to get gcc flags" >> "$ENV_FILE"
+    echo "" >> "$ENV_FILE"
+
+    echo "=== Environment variables affecting build ===" >> "$ENV_FILE"
+    echo "CC=${CC:-<unset>}" >> "$ENV_FILE"
+    echo "CXX=${CXX:-<unset>}" >> "$ENV_FILE"
+    echo "CFLAGS=${CFLAGS:-<unset>}" >> "$ENV_FILE"
+    echo "CXXFLAGS=${CXXFLAGS:-<unset>}" >> "$ENV_FILE"
+    echo "CMAKE_ARGS=${CMAKE_ARGS:-<unset>}" >> "$ENV_FILE"
     echo "" >> "$ENV_FILE"
 
     echo "=== Virtualization ===" >> "$ENV_FILE"
@@ -161,6 +187,48 @@ ci-debug-amd-avx:
     g++ -march=native -o /tmp/avx_test /tmp/avx_test.cpp 2>&1 | tee -a "$DEBUG_DIR/avx_test.txt"
     /tmp/avx_test 2>&1 | tee -a "$DEBUG_DIR/avx_test.txt" || echo "AVX2 test FAILED with exit code $?" | tee -a "$DEBUG_DIR/avx_test.txt"
 
+    # Test VAES (Vector AES-NI with YMM 256-bit registers) - likely culprit on AMD Zen3 under Hyper-V
+    echo "=== Testing VAES (256-bit vector AES) execution ===" | tee "$DEBUG_DIR/vaes_test.txt"
+    cat > /tmp/vaes_test.cpp << 'CPPEOF'
+    #include <immintrin.h>
+    #include <cstdio>
+    int main() {
+        printf("Testing VAES (256-bit vector AES-NI) instructions...\n");
+        __m256i a = _mm256_setzero_si256();
+        __m256i k = _mm256_setzero_si256();
+        __m256i r = _mm256_aesenc_epi128(a, k);
+        (void)r;
+        printf("VAES _mm256_aesenc_epi128: OK\n");
+        return 0;
+    }
+    CPPEOF
+    if g++ -march=native -mvaes -o /tmp/vaes_test /tmp/vaes_test.cpp 2>&1 | tee -a "$DEBUG_DIR/vaes_test.txt"; then
+        /tmp/vaes_test 2>&1 | tee -a "$DEBUG_DIR/vaes_test.txt" || echo "VAES test FAILED with exit code $? (SIGILL if illegal instruction)" | tee -a "$DEBUG_DIR/vaes_test.txt"
+    else
+        echo "VAES test: compiler does not support -mvaes" | tee -a "$DEBUG_DIR/vaes_test.txt"
+    fi
+
+    # Test VPCLMULQDQ (Vector Carryless Multiply with YMM 256-bit registers) - another likely culprit
+    echo "=== Testing VPCLMULQDQ (256-bit vector carryless multiply) execution ===" | tee "$DEBUG_DIR/vpclmulqdq_test.txt"
+    cat > /tmp/vpclmulqdq_test.cpp << 'CPPEOF'
+    #include <immintrin.h>
+    #include <cstdio>
+    int main() {
+        printf("Testing VPCLMULQDQ (256-bit vector carryless multiply) instructions...\n");
+        __m256i a = _mm256_setzero_si256();
+        __m256i b = _mm256_setzero_si256();
+        __m256i r = _mm256_clmulepi64_epi128(a, b, 0);
+        (void)r;
+        printf("VPCLMULQDQ _mm256_clmulepi64_epi128: OK\n");
+        return 0;
+    }
+    CPPEOF
+    if g++ -march=native -mvpclmulqdq -o /tmp/vpclmulqdq_test /tmp/vpclmulqdq_test.cpp 2>&1 | tee -a "$DEBUG_DIR/vpclmulqdq_test.txt"; then
+        /tmp/vpclmulqdq_test 2>&1 | tee -a "$DEBUG_DIR/vpclmulqdq_test.txt" || echo "VPCLMULQDQ test FAILED with exit code $? (SIGILL if illegal instruction)" | tee -a "$DEBUG_DIR/vpclmulqdq_test.txt"
+    else
+        echo "VPCLMULQDQ test: compiler does not support -mvpclmulqdq" | tee -a "$DEBUG_DIR/vpclmulqdq_test.txt"
+    fi
+
     # Show what instructions gcc generates with -march=native
     echo "=== GCC -march=native code generation ===" > "$DEBUG_DIR/gcc_codegen.txt"
     cat > /tmp/codegen_test.cpp << 'CPPEOF'
@@ -204,6 +272,15 @@ ci-debug-amd-avx:
         cat "$f" >> "$DEBUG_DIR/cmake_logs.txt" 2>&1
         echo "" >> "$DEBUG_DIR/cmake_logs.txt"
     done
+
+    # Extract key cmake settings (what compiler and flags cmake actually used)
+    echo "=== CMake compiler/flags from cache ===" > "$DEBUG_DIR/cmake_compiler_flags.txt"
+    CMAKE_CACHE_FILE=$(find target -name 'CMakeCache.txt' 2>/dev/null | head -1)
+    if [ -n "$CMAKE_CACHE_FILE" ]; then
+        grep -E '(CMAKE_CXX_COMPILER|CMAKE_C_COMPILER|CMAKE_CXX_FLAGS|MARCH|SUPPORT_AVX|SUPPORT_SSE)' "$CMAKE_CACHE_FILE" >> "$DEBUG_DIR/cmake_compiler_flags.txt" 2>&1 || true
+    else
+        echo "CMakeCache.txt not found - fastpfor may not be built yet" >> "$DEBUG_DIR/cmake_compiler_flags.txt"
+    fi
 
     echo ""
     echo "=== Running the failing test ==="
@@ -278,6 +355,65 @@ ci-debug-amd-avx:
     echo "=== AVX2 Basic Test Result ==="
     cat "$DEBUG_DIR/avx_test.txt"
     echo ""
+    echo "=== VAES Test Result ==="
+    cat "$DEBUG_DIR/vaes_test.txt"
+    echo ""
+    echo "=== VPCLMULQDQ Test Result ==="
+    cat "$DEBUG_DIR/vpclmulqdq_test.txt"
+    echo ""
+    echo "=== CMake compiler/flags ==="
+    cat "$DEBUG_DIR/cmake_compiler_flags.txt"
+    echo ""
+
+    # If the test failed, try rebuilding fastpfor with a safe march flag to check if that fixes it
+    if [ $TEST_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "=== Trying build with -march=x86-64-v3 wrapper (bypasses -march=native in fastpfor CMake) ==="
+        echo "If this passes, -march=native is generating instructions not supported by the VM hypervisor"
+        echo ""
+
+        # Create a compiler wrapper that replaces -march=native with -march=x86-64-v3
+        WRAPPER=/tmp/cxx-safe-march.sh
+        cat > "$WRAPPER" << 'WRAPEOF'
+    #!/bin/bash
+    # Wrapper: replace -march=native with -march=x86-64-v3 to avoid SIGILL on AMD under Hyper-V
+    # See: https://github.com/maplibre/maplibre-tile-spec/issues/1016
+    args=()
+    for arg in "$@"; do
+        if [[ "$arg" == "-march=native" ]]; then
+            args+=("-march=x86-64-v3")
+        else
+            args+=("$arg")
+        fi
+    done
+    exec g++ "${args[@]}"
+    WRAPEOF
+        chmod +x "$WRAPPER"
+        echo "Created compiler wrapper at $WRAPPER (replaces -march=native with -march=x86-64-v3)"
+
+        echo "=== Safe-march test output ===" > "$DEBUG_DIR/safe_march_test.txt"
+        set +e
+        CXX="$WRAPPER" cargo test -p mlt-core \
+            --target-dir "target/amd-avx-debug/safe-march-build" \
+            --all-features \
+            layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large \
+            --include-ignored \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/safe_march_test.txt"
+        SAFE_MARCH_EXIT=$?
+        set -e
+
+        echo "Safe-march test exit code: $SAFE_MARCH_EXIT" | tee -a "$DEBUG_DIR/safe_march_test.txt"
+
+        if [ $SAFE_MARCH_EXIT -eq 0 ]; then
+            echo ""
+            echo "*** SAFE-MARCH TEST PASSED! ***"
+            echo "*** Root cause confirmed: -march=native generates instructions unsupported by VM ***"
+            echo "*** Fix: update fastpfor CMakeLists.txt to allow disabling -march=native ***"
+        else
+            echo ""
+            echo "Safe-march test also failed - the issue may not be -march=native related"
+        fi
+    fi
 
     # Exit with the test result
     exit $TEST_EXIT_CODE
