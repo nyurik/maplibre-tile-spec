@@ -297,8 +297,7 @@ ci-debug-amd-avx:
     set +e
     cargo test -p mlt-core --all-features \
         layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large \
-        --include-ignored \
-        -- --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/test_output.txt"
+        -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/test_output.txt"
     TEST_EXIT_CODE=$?
     set -e
 
@@ -397,8 +396,7 @@ ci-debug-amd-avx:
             --target-dir "target/amd-avx-debug/safe-march-build" \
             --all-features \
             layer::v01::stream::tests::test_fastpfor_roundtrip::case_2_large \
-            --include-ignored \
-            -- --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/safe_march_test.txt"
+            -- --include-ignored --test-threads=1 --nocapture 2>&1 | tee -a "$DEBUG_DIR/safe_march_test.txt"
         SAFE_MARCH_EXIT=$?
         set -e
 
